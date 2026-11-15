@@ -22,6 +22,13 @@
     ]
   },
   {
+    "tool": "add_audio_track_effect",
+    "args": {},
+    "required": [
+      "edit"
+    ]
+  },
+  {
     "tool": "add_audio_transition",
     "args": {},
     "required": [
@@ -2470,6 +2477,13 @@
     ]
   },
   {
+    "tool": "list_audio_track_effects",
+    "args": {},
+    "required": [
+      "inspect"
+    ]
+  },
+  {
     "tool": "list_available_audio_effects",
     "args": {},
     "required": [
@@ -4146,6 +4160,13 @@
   },
   {
     "tool": "remove_all_effects",
+    "args": {},
+    "required": [
+      "edit"
+    ]
+  },
+  {
+    "tool": "remove_audio_track_effect",
     "args": {},
     "required": [
       "edit"

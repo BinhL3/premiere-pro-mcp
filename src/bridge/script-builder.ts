@@ -1435,13 +1435,51 @@ function __qeEffectObject(kind, entry) {
   }
 }
 
-// Resolve an effect of one kind only. Names such as DeNoise, Highpass and
-// Parametric Equalizer exist as both a video and an audio effect, so a caller
-// must look up the kind of the clip it is changing, never "video, else audio".
+// Audio effect names with no video effect of that name. QE's by-name getters
+// do not filter by kind: on Premiere 27.0 qe.project.getVideoEffectByName
+// ("Highpass") returned an object that addVideoEffect silently ignored. Used
+// only when the per-kind catalogs cannot decide. Leave out names that are
+// also video effects (Invert, Channel Mixer, Balance).
+var __AUDIO_ONLY_EFFECT_NAMES = { "Highpass": true, "Lowpass": true, "Bandpass": true, "DeNoise": true, "DeHummer": true, "DeEsser": true, "DeClicker": true, "DeReverb": true, "Adaptive Noise Reduction": true, "Automatic Click Remover": true, "Parametric Equalizer": true, "Simple Parametric EQ": true, "Graphic Equalizer (10 Bands)": true, "Graphic Equalizer (20 Bands)": true, "Graphic Equalizer (30 Bands)": true, "Notch Filter": true, "Simple Notch Filter": true, "Scientific Filter": true, "Hard Limiter": true, "Multiband Compressor": true, "Single-band Compressor": true, "Tube-modeled Compressor": true, "Dynamics": true, "Dynamics Processing": true, "Studio Reverb": true, "Convolution Reverb": true, "Surround Reverb": true, "Reverb": true, "Pitch Shifter": true, "Amplify": true, "Bass": true, "Treble": true, "Analog Delay": true, "Multitap Delay": true, "Simple Delay": true, "Chorus/Flanger": true, "Flanger": true, "Phaser": true, "Vocal Enhancer": true, "Mastering": true, "Loudness Radar": true, "Fill Left with Right": true, "Fill Right with Left": true, "Swap Channels": true, "Stereo Expander": true, "Guitar Suite": true };
+
+// true/false when this kind's QE catalog lists/omits the name, null when the
+// catalog is unavailable or empty (Premiere 26+ can return an empty one).
+function __qeCatalogHasEffect(kind, name) {
+  var catalog = __getQeEffectCatalog(kind);
+  if (!catalog.ok) return null;
+  for (var i = 0; i < catalog.effects.numItems; i++) {
+    if (catalog.effects[i].name === name) return true;
+  }
+  return false;
+}
+
+// Whether the evidence says the name exists only as the other kind's effect:
+// this kind's catalog omits it while the other kind's lists it, or, with no
+// deciding catalog, it is a known audio-only name looked up as video.
+function __qeEffectIsOtherKindOnly(kind, name) {
+  var mine = __qeCatalogHasEffect(kind, name);
+  if (mine === true) return false;
+  if (mine === false && __qeCatalogHasEffect(kind === "audio" ? "video" : "audio", name) === true) return true;
+  return kind === "video" && __AUDIO_ONLY_EFFECT_NAMES[name] === true;
+}
+
+// A by-name probe can return an effect other than the one asked for. Reject
+// it only when it carries a readable, different name.
+function __qeEffectNameMatches(effect, name) {
+  var actual = null;
+  try { actual = effect.name; } catch (eName) {}
+  if (typeof actual !== "string" || actual === "") return true;
+  return actual.toLowerCase() === String(name).toLowerCase();
+}
+
+// Resolve an effect of one kind only, or null when it is not really available
+// for that kind. A caller must look up the kind of the clip or track it is
+// changing, never "video, else audio".
 function __qeEffectByName(kind, name) {
+  if (__qeEffectIsOtherKindOnly(kind, name)) return null;
   var effect = null;
   try { effect = kind === "audio" ? qe.project.getAudioEffectByName(name) : qe.project.getVideoEffectByName(name); } catch (eByName) {}
-  if (effect) return effect;
+  if (effect && __qeEffectNameMatches(effect, name)) return effect;
   var catalog = __getQeEffectCatalog(kind);
   if (!catalog.ok) return null;
   for (var i = 0; i < catalog.effects.numItems; i++) {
@@ -1652,6 +1690,60 @@ function __qeComponentNames(qeClip) {
     names.push(String(component.name));
   }
   return names;
+}
+
+// An audio track's Audio Track Mixer components through QE (track inserts
+// plus whatever the track itself carries), or null when QE cannot list them.
+// Uses numComponents when the track has it; otherwise reads getComponentAt
+// until it returns nothing, capped well above the mixer's insert slots.
+function __qeTrackComponents(qeTrack) {
+  if (!qeTrack || typeof qeTrack.getComponentAt !== "function") return null;
+  var count = NaN;
+  try { count = Number(qeTrack.numComponents); } catch (eCount) {}
+  var counted = isFinite(count) && count >= 0 && Math.floor(count) === count;
+  var limit = counted ? count : 32;
+  var names = [];
+  for (var i = 0; i < limit; i++) {
+    var component = null;
+    try { component = qeTrack.getComponentAt(i); } catch (eAt) { if (counted) return null; break; }
+    if (!component) { if (counted) return null; break; }
+    var name = null;
+    try { name = component.name; } catch (eName) {}
+    if (typeof name !== "string" || (!counted && name === "")) { if (counted) return null; break; }
+    names.push(name);
+  }
+  return { names: names, countSource: counted ? "numComponents" : "getComponentAt" };
+}
+
+function __isBuiltInTrackComponentName(name) {
+  return __BUILT_IN_COMPONENTS[name] === true || __INTRINSIC_AUDIO_DISPLAY_NAMES[name] === true;
+}
+
+// Receipt for a track-insert add or removal, read from QE before and after.
+// expected(added, removed) says whether the observed change is the promised
+// one. Unchanged components are not_applied unless the undo stack moved.
+function __trackComponentReceipt(before, after, threw, expected) {
+  var evidence = { before: before.names, after: after ? after.names : null, countSource: before.countSource, undoSteps: null };
+  var undoNow = __undoStart !== null ? __readUndoIndex() : null;
+  var undoKnown = __undoStart !== null && undoNow !== null;
+  if (undoKnown) evidence.undoSteps = undoNow - __undoStart;
+  if (!after) return { mutationOutcome: "unknown", timelineChanged: null, evidence: evidence, uncertainty: "The track's components could not be read back after the call." };
+  var remaining = after.names.slice(0);
+  var removed = [];
+  for (var b = 0; b < before.names.length; b++) {
+    var found = -1;
+    for (var r = 0; r < remaining.length; r++) if (remaining[r] === before.names[b]) { found = r; break; }
+    if (found < 0) removed.push(before.names[b]); else remaining.splice(found, 1);
+  }
+  evidence.added = remaining;
+  evidence.removed = removed;
+  if (!remaining.length && !removed.length) {
+    if (!undoKnown || undoNow === __undoStart) return { mutationOutcome: "not_applied", timelineChanged: false, evidence: evidence };
+    return { mutationOutcome: "unknown", timelineChanged: null, evidence: evidence, uncertainty: "The track's components read back unchanged, but Premiere recorded " + (undoNow - __undoStart) + " undo step(s), so something else may have changed." };
+  }
+  if (expected(remaining, removed)) return { mutationOutcome: threw ? "committed_unverified" : "verified", timelineChanged: true, evidence: evidence };
+  if (threw) return { mutationOutcome: "unknown", timelineChanged: true, evidence: evidence, uncertainty: "Premiere threw during the call and the track's components changed, so the host may be mid-operation." };
+  return { mutationOutcome: "committed_unverified", timelineChanged: true, evidence: evidence };
 }
 
 // Every removal ends with a determinate receipt where the evidence allows:

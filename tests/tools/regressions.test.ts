@@ -22,6 +22,7 @@ import { getExportTools } from "../../src/tools/export.js";
 import { getUtilityTools, sequenceFrameTicks } from "../../src/tools/utility.js";
 import { getTrackTargetingTools } from "../../src/tools/track-targeting.js";
 import { getEffectsTools } from "../../src/tools/effects.js";
+import { runWithUndoTracking } from "../../src/bridge/undo-tracking.js";
 import { getClipboardTools } from "../../src/tools/clipboard.js";
 import { getTimelineTools } from "../../src/tools/timeline.js";
 import { getAdvancedTools } from "../../src/tools/advanced.js";
@@ -1867,13 +1868,25 @@ describe("source evidence preserves lookup failures", () => {
     expect(mockedSendCommand).toHaveBeenCalledTimes(1);
   });
 });
-
-// Premiere 27: DeNoise, Highpass and Parametric Equalizer exist as both video
-// and audio effects, so batch_apply_effect must resolve the clip's own kind.
+// QE's by-name getters do not filter by kind: on Premiere 27.0
+// getVideoEffectByName("Highpass") returned an object that addVideoEffect
+// ignored. batch_apply_effect must resolve each clip's own kind and skip a
+// kind the effect is not really available for.
 describe("batch_apply_effect resolves the effect kind per clip", () => {
   const clipboard = getClipboardTools(bridgeOptions);
 
-  function batchHost(options: { video: string[]; audio: string[]; selected?: boolean; audioAddNoop?: boolean }) {
+  type HostOptions = {
+    video: string[];
+    audio: string[];
+    selected?: boolean;
+    audioAddNoop?: boolean;
+    // Premiere 27.0: the video getter answers for any name, and the add is a no-op.
+    videoByNameAnswersAll?: boolean;
+    videoByNameReturns?: string;
+    catalogs?: { video: string[]; audio: string[] };
+  };
+
+  function batchHost(options: HostOptions) {
     const applied: Array<{ clip: string; kind: string }> = [];
     function makeClip(name: string, kind: "video" | "audio") {
       const list: Array<{ displayName: string; matchName: string }> = kind === "audio"
@@ -1881,8 +1894,9 @@ describe("batch_apply_effect resolves the effect kind per clip", () => {
         : [{ displayName: "Motion", matchName: "AE.ADBE Motion" }];
       const components = new Proxy({}, { get: (_t, key) => (key === "numItems" ? list.length : list[Number(key)]) });
       const clip = { nodeId: name, name, start: { ticks: "0" }, end: { ticks: "254016000000" }, components, isSelected: () => options.selected !== false };
-      const add = (effect: { kind: string; name: string }) => {
+      const add = (effect: { kind: string; name: string; real: boolean }) => {
         applied.push({ clip: name, kind: effect.kind });
+        if (!effect.real) return;
         if (effect.kind !== kind) throw new Error("wrong effect kind for this clip");
         if (kind === "audio" && options.audioAddNoop) return;
         list.push({ displayName: effect.name, matchName: effect.name });
@@ -1893,6 +1907,10 @@ describe("batch_apply_effect resolves the effect kind per clip", () => {
     const v = makeClip("Picture", "video");
     const a = makeClip("Dialogue", "audio");
     const seq = { sequenceID: "s", videoTracks: { numTracks: 1, 0: { clips: { numItems: 1, 0: v.clip } } }, audioTracks: { numTracks: 1, 0: { clips: { numItems: 1, 0: a.clip } } } };
+    const videoByName = (name: string) => {
+      if (options.video.includes(name)) return { kind: "video", name: options.videoByNameReturns ?? name, real: options.videoByNameReturns === undefined };
+      return options.videoByNameAnswersAll ? { kind: "video", name, real: false } : null;
+    };
     mockedSendCommand.mockImplementation(async (script: string) => {
       const source = `${getHelpersSource()}\n${script}`;
       parse(source, { ecmaVersion: 3, allowReserved: "never" });
@@ -1900,53 +1918,228 @@ describe("batch_apply_effect resolves the effect kind per clip", () => {
         app: { enableQE: () => {}, project: { activeSequence: seq } },
         qe: { project: {
           getActiveSequence: () => ({ getVideoTrackAt: () => v.qeTrack, getAudioTrackAt: () => a.qeTrack }),
-          getVideoEffectByName: (name: string) => (options.video.includes(name) ? { kind: "video", name } : null),
-          getAudioEffectByName: (name: string) => (options.audio.includes(name) ? { kind: "audio", name } : null),
+          getVideoEffectByName: videoByName,
+          getAudioEffectByName: (name: string) => (options.audio.includes(name) ? { kind: "audio", name, real: true } : null),
+          ...(options.catalogs ? { getVideoEffectList: () => options.catalogs!.video, getAudioEffectList: () => options.catalogs!.audio } : {}),
         } },
       })));
     });
     return applied;
   }
 
-  it.each(["DeNoise", "Highpass", "Parametric Equalizer"])("applies the audio %s to an audio track even when a video effect has that name", async (name) => {
-    const applied = batchHost({ video: [name], audio: [name] });
+  it.each(["DeNoise", "Highpass", "Parametric Equalizer"])("applies the audio %s to an audio track even when the video getter answers", async (name) => {
+    const applied = batchHost({ video: [], audio: [name], videoByNameAnswersAll: true });
     await expect(clipboard.batch_apply_effect.handler({ effect_name: name, target: "track", track_type: "audio", track_index: 0 }))
-      .resolves.toMatchObject({ success: true, data: { applied: 1, effectType: "audio", scope: "per_clip" } });
+      .resolves.toMatchObject({ success: true, data: { applied: 1, effectType: "audio", scope: "per_clip", outcome: "verified" } });
     expect(applied).toEqual([{ clip: "Dialogue", kind: "audio" }]);
   });
 
   it.each(["selected", "all"] as const)("gives each clip its own kind of a shared name for %s", async (target) => {
-    const applied = batchHost({ video: ["DeNoise"], audio: ["DeNoise"] });
-    await expect(clipboard.batch_apply_effect.handler({ effect_name: "DeNoise", target }))
-      .resolves.toMatchObject({ success: true, data: { applied: 2, appliedByKind: { video: 1, audio: 1 }, selectedIncompatible: 0 } });
+    const applied = batchHost({ video: ["Invert"], audio: ["Invert"] });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "Invert", target }))
+      .resolves.toMatchObject({ success: true, data: { applied: 2, appliedByKind: { video: 1, audio: 1 }, selectedIncompatible: 0, incompatibleByKind: { video: 0, audio: 0 } } });
     expect(applied).toEqual([{ clip: "Picture", kind: "video" }, { clip: "Dialogue", kind: "audio" }]);
   });
 
-  it("skips clips whose kind has no effect of that name", async () => {
-    const applied = batchHost({ video: [], audio: ["Hard Limiter"] });
-    await expect(clipboard.batch_apply_effect.handler({ effect_name: "Hard Limiter", target: "selected" }))
-      .resolves.toMatchObject({ success: true, data: { applied: 1, effectType: "audio", selectedIncompatible: 1 } });
+  // The live Premiere 27.0 report: a video and its linked audio clip selected.
+  it.each([
+    ["a known audio-only name", { video: [], audio: ["Highpass"], videoByNameAnswersAll: true }, "Highpass"],
+    ["the catalogs", { video: [], audio: ["Spectral Gate"], videoByNameAnswersAll: true, catalogs: { video: ["Gaussian Blur"], audio: ["Spectral Gate"] } }, "Spectral Gate"],
+    ["a by-name probe that names another effect", { video: ["Spectral Gate"], audio: ["Spectral Gate"], videoByNameReturns: "Gaussian Blur" }, "Spectral Gate"],
+  ] as const)("skips a selected video clip as incompatible, detected by %s", async (_label, options, name) => {
+    const applied = batchHost({ ...options, video: [...options.video], audio: [...options.audio] });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: name, target: "selected" }))
+      .resolves.toMatchObject({ success: true, data: { applied: 1, effectType: "audio", selectedIncompatible: 1, incompatibleByKind: { video: 1, audio: 0 }, outcome: "verified" } });
     expect(applied).toEqual([{ clip: "Dialogue", kind: "audio" }]);
   });
 
-  it("refuses a video-only effect on an audio track before changing anything", async () => {
-    const applied = batchHost({ video: ["Gaussian Blur"], audio: [] });
-    await expect(clipboard.batch_apply_effect.handler({ effect_name: "Gaussian Blur", target: "track", track_type: "audio", track_index: 0 }))
-      .resolves.toMatchObject({ success: false, error: expect.stringContaining("only a video effect") });
+  it("lets a video catalog entry win over the audio-only list", async () => {
+    const applied = batchHost({ video: ["DeNoise"], audio: ["DeNoise"], catalogs: { video: ["DeNoise"], audio: ["DeNoise"] } });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "DeNoise", target: "all" }))
+      .resolves.toMatchObject({ success: true, data: { applied: 2, incompatibleByKind: { video: 0, audio: 0 } } });
+    expect(applied).toEqual([{ clip: "Picture", kind: "video" }, { clip: "Dialogue", kind: "audio" }]);
+  });
+
+  it("counts skipped clips for target all", async () => {
+    batchHost({ video: [], audio: ["Hard Limiter"], videoByNameAnswersAll: true });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "Hard Limiter", target: "all" }))
+      .resolves.toMatchObject({ success: true, data: { applied: 1, selectedIncompatible: 0, incompatibleByKind: { video: 1, audio: 0 }, note: expect.stringContaining("Skipped 1 video") } });
+  });
+
+  it.each([
+    ["video", "Highpass", { video: [], audio: ["Highpass"], videoByNameAnswersAll: true }, "only an audio effect"],
+    ["audio", "Gaussian Blur", { video: ["Gaussian Blur"], audio: [] }, "only a video effect"],
+  ] as const)("refuses a %s track target for %s before changing anything", async (trackType, name, options, message) => {
+    const applied = batchHost({ ...options, video: [...options.video], audio: [...options.audio] });
+    await expect(runWithUndoTracking(true, () => clipboard.batch_apply_effect.handler({ effect_name: name, target: "track", track_type: trackType, track_index: 0 })))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining(message), data: { mutationOutcome: "not_applied" } });
     expect(applied).toEqual([]);
   });
 
   it("keeps apply_effect and apply_audio_effect on their own clip kind", async () => {
     const effects = getEffectsTools(bridgeOptions);
-    const applied = batchHost({ video: ["DeNoise"], audio: ["DeNoise"] });
-    await expect(effects.apply_effect.handler({ node_id: "Dialogue", effect_name: "DeNoise" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("Use apply_audio_effect") });
-    await expect(effects.apply_audio_effect.handler({ node_id: "Picture", effect_name: "DeNoise" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("Use apply_effect") });
+    const applied = batchHost({ video: ["Invert"], audio: ["Invert"] });
+    await expect(effects.apply_effect.handler({ node_id: "Dialogue", effect_name: "Invert" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("Use apply_audio_effect") });
+    await expect(effects.apply_audio_effect.handler({ node_id: "Picture", effect_name: "Invert" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("Use apply_effect") });
+    expect(applied).toEqual([]);
+  });
+
+  it("refuses an audio-only name on a video clip in apply_effect", async () => {
+    const effects = getEffectsTools(bridgeOptions);
+    const applied = batchHost({ video: [], audio: ["Highpass"], videoByNameAnswersAll: true });
+    await expect(runWithUndoTracking(true, () => effects.apply_effect.handler({ node_id: "Picture", effect_name: "Highpass" })))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining("is an audio effect"), data: { mutationOutcome: "not_applied" } });
     expect(applied).toEqual([]);
   });
 
   it("reports a partly applied batch as committed, not unknown", async () => {
-    batchHost({ video: ["DeNoise"], audio: ["DeNoise"], audioAddNoop: true });
-    await expect(clipboard.batch_apply_effect.handler({ effect_name: "DeNoise", target: "all" }))
+    batchHost({ video: ["Invert"], audio: ["Invert"], audioAddNoop: true });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "Invert", target: "all" }))
       .resolves.toMatchObject({ success: false, data: { mutationOutcome: "committed_unverified", timelineChanged: true, applied: 1 } });
+  });
+});
+
+// Audio Track Mixer inserts through the QE audio track (Premiere 27.0 reflects
+// addAudioEffect and getComponentAt on it).
+describe("audio track inserts", () => {
+  const effects = getEffectsTools(bridgeOptions);
+  // The server tracks undo for every edit call; refusals report not_applied only then.
+  const addInsert = (args: Parameters<typeof effects.add_audio_track_effect.handler>[0]) => runWithUndoTracking(true, () => effects.add_audio_track_effect.handler(args));
+  const removeInsert = (args: Parameters<typeof effects.remove_audio_track_effect.handler>[0]) => runWithUndoTracking(true, () => effects.remove_audio_track_effect.handler(args));
+
+  type TrackOptions = {
+    components?: string[];
+    numComponents?: boolean;
+    addNoop?: boolean;
+    addThrows?: boolean;
+    noAdd?: boolean;
+    noRemove?: boolean;
+    removeNoop?: boolean;
+    undo?: number[];
+    audioEffects?: string[];
+    videoEffects?: string[];
+  };
+
+  function trackHost(options: TrackOptions = {}) {
+    const list = [...(options.components ?? ["Volume", "Balance"])];
+    const calls: string[] = [];
+    const undo = options.undo ? [...options.undo] : null;
+    const qeTrack: Record<string, unknown> = {
+      getComponentAt: (index: number) => (index < list.length ? {
+        name: list[index],
+        ...(options.noRemove ? {} : { remove: () => { calls.push(`remove:${list[index]}`); if (!options.removeNoop) list.splice(index, 1); } }),
+      } : null),
+      ...(options.noAdd ? {} : { addAudioEffect: (effect: { name: string }) => {
+        calls.push(`add:${effect.name}`);
+        if (options.addThrows) throw new Error("slots full");
+        if (!options.addNoop) list.push(effect.name);
+      } }),
+    };
+    if (options.numComponents !== false) Object.defineProperty(qeTrack, "numComponents", { get: () => list.length });
+    const seq = { sequenceID: "s", audioTracks: { numTracks: 2, 0: { name: "A1" }, 1: { name: "A2" } }, videoTracks: { numTracks: 0 } };
+    const audio = options.audioEffects ?? ["Highpass"];
+    const video = options.videoEffects ?? [];
+    mockedSendCommand.mockImplementation(async (script: string) => {
+      const source = `${getHelpersSource()}\n${script}`;
+      parse(source, { ecmaVersion: 3, allowReserved: "never" });
+      return JSON.parse(String(runInNewContext(source, {
+        app: { enableQE: () => {}, project: { activeSequence: seq } },
+        qe: { project: {
+          ...(undo ? { undoStackIndex: () => (undo.length > 1 ? undo.shift() : undo[0]) } : {}),
+          getActiveSequence: () => ({ getAudioTrackAt: (index: number) => (index === 0 ? qeTrack : null) }),
+          getAudioEffectByName: (name: string) => (audio.includes(name) ? { name } : null),
+          getVideoEffectByName: (name: string) => (video.includes(name) ? { name } : null),
+        } },
+      })));
+    });
+    return { list, calls };
+  }
+
+  it.each([true, false])("lists a track's components (numComponents %s)", async (numComponents) => {
+    trackHost({ components: ["Volume", "Highpass"], numComponents });
+    await expect(effects.list_audio_track_effects.handler({ track_index: 0 })).resolves.toMatchObject({
+      success: true,
+      data: { trackName: "A1", count: 2, countSource: numComponents ? "numComponents" : "getComponentAt", components: [{ index: 0, name: "Volume", builtIn: true }, { index: 1, name: "Highpass", builtIn: false }] },
+    });
+  });
+
+  it("adds a track insert and verifies it by QE readback", async () => {
+    const host = trackHost();
+    await expect(addInsert({ track_index: 0, effect_name: "Highpass" })).resolves.toMatchObject({
+      success: true,
+      data: { verified: true, outcome: "verified", scope: "track", addedComponent: { index: 2, name: "Highpass" } },
+    });
+    expect(host.list).toEqual(["Volume", "Balance", "Highpass"]);
+  });
+
+  it.each([
+    ["an ignored add", { addNoop: true }, "added no insert"],
+    ["a thrown add", { addThrows: true }, "slots full"],
+  ] as const)("reports %s that left the track unchanged as not applied", async (_label, options, message) => {
+    trackHost(options);
+    await expect(addInsert({ track_index: 0, effect_name: "Highpass" }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining(message), data: { mutationOutcome: "not_applied", timelineChanged: false } });
+  });
+
+  it.each([
+    ["a missing addAudioEffect", { noAdd: true }, "Highpass", "no addAudioEffect"],
+    ["a video-only name", { videoEffects: ["Gaussian Blur"] }, "Gaussian Blur", "is a video effect"],
+    ["an unknown name", {}, "Nope", "Audio effect not found"],
+  ] as const)("refuses %s before changing anything", async (_label, options, name, message) => {
+    const host = trackHost(options);
+    await expect(addInsert({ track_index: 0, effect_name: name }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining(message), data: { mutationOutcome: "not_applied" } });
+    expect(host.calls).toEqual([]);
+  });
+
+  it("refuses an out-of-range track and invalid input", async () => {
+    trackHost();
+    await expect(addInsert({ track_index: 5, effect_name: "Highpass" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("out of range") });
+    await expect(addInsert({ track_index: -1, effect_name: "Highpass" })).resolves.toMatchObject({ success: false, error: "track_index must be a non-negative integer" });
+    await expect(removeInsert({ track_index: 0, effect_name: "Highpass", index: 1.5 })).resolves.toMatchObject({ success: false, error: "index must be a non-negative integer" });
+  });
+
+  it("escapes the effect name", async () => {
+    const name = 'High"pass\\\n';
+    const host = trackHost({ audioEffects: [name] });
+    await expect(addInsert({ track_index: 0, effect_name: name })).resolves.toMatchObject({ success: true });
+    expect(host.list.at(-1)).toBe(name);
+  });
+
+  it("calls an unchanged readback unknown when the undo stack moved", async () => {
+    trackHost({ addNoop: true, undo: [10, 11] });
+    await expect(addInsert({ track_index: 0, effect_name: "Highpass" }))
+      .resolves.toMatchObject({ success: false, data: { mutationOutcome: "unknown" } });
+  });
+
+  it("removes the last matching insert and verifies", async () => {
+    const host = trackHost({ components: ["Volume", "Highpass", "DeNoise", "Highpass"] });
+    await expect(removeInsert({ track_index: 0, effect_name: "Highpass" }))
+      .resolves.toMatchObject({ success: true, data: { verified: true, index: 3, remaining: ["Volume", "Highpass", "DeNoise"] } });
+    expect(host.calls).toEqual(["remove:Highpass"]);
+  });
+
+  it("removes the insert at a given index", async () => {
+    const host = trackHost({ components: ["Volume", "Highpass", "Highpass"] });
+    await expect(removeInsert({ track_index: 0, effect_name: "Highpass", index: 1 })).resolves.toMatchObject({ success: true, data: { index: 1 } });
+    expect(host.list).toEqual(["Volume", "Highpass"]);
+  });
+
+  it.each([
+    ["a component without remove()", { components: ["Volume", "Highpass"], noRemove: true }, "Highpass", undefined, "no remove()"],
+    ["a built-in component", { components: ["Volume", "Highpass"] }, "Volume", undefined, "built-in track component"],
+    ["a missing insert", { components: ["Volume"] }, "Highpass", undefined, "has no insert named"],
+    ["an index holding another name", { components: ["Volume", "DeNoise"] }, "Highpass", 1, "at index 1"],
+  ] as const)("refuses %s before changing anything", async (_label, options, name, index, message) => {
+    const host = trackHost({ ...options, components: [...options.components] });
+    await expect(removeInsert({ track_index: 0, effect_name: name, index }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining(message), data: { mutationOutcome: "not_applied" } });
+    expect(host.calls).toEqual([]);
+  });
+
+  it("reports an ignored removal as not applied", async () => {
+    trackHost({ components: ["Volume", "Highpass"], removeNoop: true });
+    await expect(removeInsert({ track_index: 0, effect_name: "Highpass" }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining("ignored the removal"), data: { mutationOutcome: "not_applied" } });
   });
 });

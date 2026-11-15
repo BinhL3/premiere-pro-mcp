@@ -81,6 +81,37 @@ function applyEffectWithReadback(kind: "Video" | "Audio"): string {
   `;
 }
 
+/** ES3 prelude resolving QE audio track `trackIndex` for the track-insert tools. */
+function audioTrackPrelude(trackIndex: number): string {
+  return `
+    app.enableQE();
+    var seq = app.project.activeSequence;
+    if (!seq) return __refuse("No active sequence");
+    var qeSeq = qe.project.getActiveSequence();
+    if (!qeSeq) return __refuse("No active sequence (QE)");
+    var trackIndex = ${trackIndex};
+    if (trackIndex >= seq.audioTracks.numTracks) return __refuse("Audio track index " + trackIndex + " is out of range; the sequence has " + seq.audioTracks.numTracks + " audio track(s).");
+    function readQeTrack() {
+      var found = null;
+      try { found = qeSeq.getAudioTrackAt(trackIndex); } catch (eTrack) {}
+      return found;
+    }
+    var qeTrack = readQeTrack();
+    if (!qeTrack) return __refuse("QE audio track " + trackIndex + " not found");
+    var trackName = "";
+    try { trackName = String(seq.audioTracks[trackIndex].name); } catch (eTrackName) {}
+  `;
+}
+
+const TRACK_INDEX_PARAMETER = {
+  type: "number",
+  description: "Zero-based audio track index (0 is A1)",
+};
+
+function invalidTrackIndex(value: unknown): boolean {
+  return !Number.isInteger(value) || (value as number) < 0;
+}
+
 export function getEffectsTools(bridgeOptions: BridgeOptions) {
   return {
     apply_effect: {
@@ -109,7 +140,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           if (!result) return __refuse("Clip not found: ${escapeForExtendScript(args.node_id)}");
           
           var effectName = "${escapeForExtendScript(args.effect_name)}";
-          // Names such as DeNoise exist as both kinds; never put a video effect on an audio clip.
+          // QE's by-name getters do not filter by kind; never put a video effect on an audio clip.
           if (result.trackType !== "video") return __refuse("apply_effect adds video effects, and " + result.clip.name + " is an audio clip. Use apply_audio_effect; nothing was changed.");
           var qeTrack = qeSeq.getVideoTrackAt(result.trackIndex);
           if (!qeTrack) return __refuse("QE track not found");
@@ -121,8 +152,10 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           // Premiere 26 can expose direct by-name lookup while returning an
           // empty QE catalog. Probe the requested name before consulting the
           // catalog so a known installed effect remains usable.
+          if (__qeEffectIsOtherKindOnly("video", effectName)) return __refuse(effectName + " is an audio effect, not a video effect. Use apply_audio_effect on an audio clip, or add_audio_track_effect for an Audio Track Mixer insert; nothing was changed.");
           var qeEffect = null;
           try { qeEffect = qe.project.getVideoEffectByName(effectName); } catch (byNameError) {}
+          if (qeEffect && !__qeEffectNameMatches(qeEffect, effectName)) qeEffect = null;
           var lookupSource = qeEffect ? "qe.byName" : "qe.catalog";
           if (!qeEffect) {
             var effectCatalog = __getQeEffectCatalog("video");
@@ -143,7 +176,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
     },
 
     apply_audio_effect: {
-      description: "Apply an audio effect to one audio clip (video clips are refused). It is a clip effect, not an Audio Track Mixer track insert, which Premiere's scripting APIs do not expose. Experimental QE catalog lookup includes an exact-name probe when enumeration is empty. A component-list readback does not verify rendered audio.",
+      description: "Apply an audio effect to one audio clip (video clips are refused). It is a clip effect; use add_audio_track_effect for an Audio Track Mixer track insert. Experimental QE catalog lookup includes an exact-name probe when enumeration is empty. A component-list readback does not verify rendered audio.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -176,8 +209,10 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           var qeClip = __findQeClipByDomClip(qeTrack, result.clip);
           if (!qeClip) return __refuse("Could not match the QE clip for " + result.clip.name + " by timeline start; nothing was changed.");
           
+          if (__qeEffectIsOtherKindOnly("audio", effectName)) return __refuse(effectName + " is a video effect, not an audio effect. Use apply_effect on a video clip; nothing was changed.");
           var qeEffect = null;
           try { qeEffect = qe.project.getAudioEffectByName(effectName); } catch (byNameError) {}
+          if (qeEffect && !__qeEffectNameMatches(qeEffect, effectName)) qeEffect = null;
           var lookupSource = qeEffect ? "qe.byName" : "qe.catalog";
           if (!qeEffect) {
             var effectCatalog = __getQeEffectCatalog("audio");
@@ -298,6 +333,138 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
             list.push({ name: effects[i].name, index: i });
           }
           return __result(list);
+        `);
+        return sendCommand(script, bridgeOptions);
+      },
+    },
+
+    list_audio_track_effects: {
+      description: "List an audio track's Audio Track Mixer components (track inserts such as an added Highpass, plus any components the track itself carries), read through the undocumented QE DOM's track getComponentAt(). EXPERIMENTAL. builtIn marks names this server never removes. These are track-level, not clip effects; use list_clip_effects for a clip.",
+      parameters: {
+        type: "object" as const,
+        properties: {
+          track_index: TRACK_INDEX_PARAMETER,
+        },
+        required: ["track_index"],
+      },
+      handler: async (args: { track_index: number }) => {
+        if (invalidTrackIndex(args.track_index)) return { success: false, error: "track_index must be a non-negative integer" };
+        const script = buildToolScript(`
+          ${audioTrackPrelude(args.track_index)}
+          var read = __qeTrackComponents(qeTrack);
+          if (!read) return __error("Capability error: QE cannot list audio track " + trackIndex + "'s components in this Premiere build (no getComponentAt(), or an unreadable component).");
+          var components = [];
+          for (var i = 0; i < read.names.length; i++) components.push({ index: i, name: read.names[i], builtIn: __isBuiltInTrackComponentName(read.names[i]) });
+          return __result({ trackIndex: trackIndex, trackName: trackName, count: read.names.length, countSource: read.countSource, components: components, scope: "track" });
+        `);
+        return sendCommand(script, bridgeOptions);
+      },
+    },
+
+    add_audio_track_effect: {
+      description: "Add an audio effect as a track insert on one audio track (an Audio Track Mixer effect slot, applied to everything on the track), not to its clips. EXPERIMENTAL: uses the undocumented QE DOM's audio track addAudioEffect(), resolving the name among audio effects only, and verifies by reading the track's QE components back (not rendered audio). Undo it with remove_audio_track_effect, which works only where QE exposes remove() on track components; otherwise remove the insert in the Audio Track Mixer or with undo. For per-clip effects use apply_audio_effect or batch_apply_effect.",
+      parameters: {
+        type: "object" as const,
+        properties: {
+          track_index: TRACK_INDEX_PARAMETER,
+          effect_name: {
+            type: "string",
+            description: "Display name of the audio effect (e.g., 'Highpass', 'DeNoise', 'Parametric Equalizer')",
+          },
+        },
+        required: ["track_index", "effect_name"],
+      },
+      handler: async (args: { track_index: number; effect_name: string }) => {
+        if (invalidTrackIndex(args.track_index)) return { success: false, error: "track_index must be a non-negative integer" };
+        if (typeof args.effect_name !== "string" || !args.effect_name.trim()) return { success: false, error: "effect_name must not be empty" };
+        const script = buildToolScript(`
+          ${audioTrackPrelude(args.track_index)}
+          var effectName = "${escapeForExtendScript(args.effect_name)}";
+          if (typeof qeTrack.addAudioEffect !== "function") return __refuse("Capability error: this Premiere build's QE audio track has no addAudioEffect(); nothing was changed.");
+          var before = __qeTrackComponents(qeTrack);
+          if (!before) return __refuse("Capability error: QE cannot list audio track " + trackIndex + "'s components, so a track insert could not be verified; nothing was changed.");
+          var effect = __qeEffectByName("audio", effectName);
+          if (!effect) {
+            if (__qeEffectByName("video", effectName)) return __refuse(effectName + " is a video effect, not an audio effect; nothing was changed.");
+            return __refuse("Audio effect not found: " + effectName + ". Nothing was changed.");
+          }
+          var addError = "";
+          try { qeTrack.addAudioEffect(effect); } catch (eAdd) { addError = String(eAdd); }
+          var receipt = __trackComponentReceipt(before, __qeTrackComponents(readQeTrack()), addError !== "", function (added, removed) { return added.length === 1 && removed.length === 0; });
+          if (addError) receipt.hostError = addError;
+          receipt.trackIndex = trackIndex;
+          receipt.effect = effectName;
+          receipt.scope = "track";
+          if (receipt.mutationOutcome === "verified") {
+            receipt.verified = true;
+            receipt.outcome = "verified";
+            receipt.addedComponent = { index: receipt.evidence.after.length - 1, name: receipt.evidence.added[0] };
+            receipt.verificationScope = "QE track component readback only; verify rendered audio before delivery.";
+            return __result(receipt);
+          }
+          if (receipt.mutationOutcome === "not_applied") return __error("Premiere added no insert to audio track " + trackIndex + (addError ? " (" + addError + ")" : "") + "; the track's components are unchanged. Its insert slots may be full.", receipt);
+          return __error("Adding " + effectName + " to audio track " + trackIndex + " was not verified" + (receipt.uncertainty ? ": " + receipt.uncertainty : "; the track's components changed unexpectedly.") + " Inspect the Audio Track Mixer before any retry.", receipt);
+        `);
+        return sendCommand(script, bridgeOptions);
+      },
+    },
+
+    remove_audio_track_effect: {
+      description: "Remove one track insert from an audio track (Audio Track Mixer effect slot) and verify by reading the track's QE components back. EXPERIMENTAL: uses the undocumented QE DOM's track getComponentAt(i).remove(); when this Premiere build exposes no remove() there, it returns a capability error with nothing changed. Built-in track components are refused. Takes the last instance when names repeat unless index (from list_audio_track_effects) is given.",
+      parameters: {
+        type: "object" as const,
+        properties: {
+          track_index: TRACK_INDEX_PARAMETER,
+          effect_name: {
+            type: "string",
+            description: "Name of the insert as list_audio_track_effects reports it",
+          },
+          index: {
+            type: "number",
+            description: "Optional component index from list_audio_track_effects; the component there must have effect_name",
+          },
+        },
+        required: ["track_index", "effect_name"],
+      },
+      handler: async (args: { track_index: number; effect_name: string; index?: number }) => {
+        if (invalidTrackIndex(args.track_index)) return { success: false, error: "track_index must be a non-negative integer" };
+        if (typeof args.effect_name !== "string" || !args.effect_name.trim()) return { success: false, error: "effect_name must not be empty" };
+        if (args.index !== undefined && invalidTrackIndex(args.index)) return { success: false, error: "index must be a non-negative integer" };
+        const script = buildToolScript(`
+          ${audioTrackPrelude(args.track_index)}
+          var effectName = "${escapeForExtendScript(args.effect_name)}";
+          var wantedIndex = ${args.index === undefined ? "null" : args.index};
+          if (__isBuiltInTrackComponentName(effectName)) return __refuse(effectName + " is a built-in track component, not a track insert, and cannot be removed.");
+          var before = __qeTrackComponents(qeTrack);
+          if (!before) return __refuse("Capability error: QE cannot list audio track " + trackIndex + "'s components; nothing was changed.");
+          var at = -1;
+          if (wantedIndex !== null) {
+            if (wantedIndex >= before.names.length || before.names[wantedIndex] !== effectName) return __refuse("Audio track " + trackIndex + " has no " + effectName + " at index " + wantedIndex + "; its components are " + before.names.join(", ") + ". Nothing was changed.");
+            at = wantedIndex;
+          } else {
+            for (var i = before.names.length - 1; i >= 0; i--) if (before.names[i] === effectName) { at = i; break; }
+            if (at < 0) return __refuse("Audio track " + trackIndex + " has no insert named " + effectName + "; its components are " + before.names.join(", ") + ". Nothing was changed.");
+          }
+          var component = null;
+          try { component = qeTrack.getComponentAt(at); } catch (eAt) {}
+          if (!component || String(component.name) !== effectName) return __refuse("Audio track " + trackIndex + "'s component " + at + " no longer reads as " + effectName + "; nothing was changed.");
+          if (typeof component.remove !== "function") return __refuse("Capability error: this Premiere build's QE exposes no remove() on audio track components, so track inserts cannot be removed by script. Nothing was changed; remove it in the Audio Track Mixer or undo the add.");
+          var removeError = "";
+          try { component.remove(); } catch (eRemove) { removeError = String(eRemove); }
+          var receipt = __trackComponentReceipt(before, __qeTrackComponents(readQeTrack()), removeError !== "", function (added, removed) { return added.length === 0 && removed.length === 1 && removed[0] === effectName; });
+          if (removeError) receipt.hostError = removeError;
+          receipt.trackIndex = trackIndex;
+          receipt.effect = effectName;
+          receipt.index = at;
+          receipt.scope = "track";
+          if (receipt.mutationOutcome === "verified") {
+            receipt.verified = true;
+            receipt.outcome = "verified";
+            receipt.remaining = receipt.evidence.after;
+            return __result(receipt);
+          }
+          if (receipt.mutationOutcome === "not_applied") return __error("Premiere " + (removeError ? "refused the removal (" + removeError + ")" : "ignored the removal") + "; audio track " + trackIndex + "'s components are unchanged.", receipt);
+          return __error("Removing " + effectName + " from audio track " + trackIndex + " was not verified" + (receipt.uncertainty ? ": " + receipt.uncertainty : "; the track's components changed unexpectedly.") + " Inspect the Audio Track Mixer before any retry.", receipt);
         `);
         return sendCommand(script, bridgeOptions);
       },

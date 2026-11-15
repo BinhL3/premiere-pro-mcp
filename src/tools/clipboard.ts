@@ -843,7 +843,7 @@ export function getClipboardTools(bridgeOptions: BridgeOptions) {
     },
 
     batch_apply_effect: {
-      description: "Apply one effect to clips: the selected clips, every clip on one track, or every clip in the sequence. Audio clips get the audio effect and video clips the video effect of that name (DeNoise, Highpass and Parametric Equalizer exist as both). The effect is always added per clip: target 'track' copies it onto each clip on the track, not into the Audio Track Mixer's track effect slots, which Premiere's scripting APIs do not expose. Uses QE DOM. Every target is preflighted and then checked by component-count readback.",
+      description: "Apply one effect to clips: the selected clips, every clip on one track, or every clip in the sequence. Audio clips get the audio effect and video clips the video effect of that name; clips of a kind the effect is not available for (Highpass on a video clip) are skipped and counted in incompatibleByKind, and a track target of the wrong kind is refused. The effect is always added per clip: target 'track' copies it onto each clip on the track; use add_audio_track_effect for an Audio Track Mixer insert. Uses QE DOM. Every target is preflighted and then checked by component-count readback.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -889,15 +889,15 @@ export function getClipboardTools(bridgeOptions: BridgeOptions) {
           var effectName = "${escapeForExtendScript(args.effect_name)}";
           var target = "${args.target}";
           var requestedTrackType = "${args.target === "track" ? args.track_type : ""}";
-          // Resolve per kind: DeNoise, Highpass and Parametric Equalizer also
-          // match a video effect, so an audio clip must get the audio effect.
+          // Resolve per kind: QE's by-name getters do not filter by kind, so
+          // an audio-only name can still return a (useless) video effect.
           var effectsByKind = { video: null, audio: null };
           if (requestedTrackType !== "audio") effectsByKind.video = __qeEffectByName("video", effectName);
           if (requestedTrackType !== "video") effectsByKind.audio = __qeEffectByName("audio", effectName);
           if (requestedTrackType && !effectsByKind[requestedTrackType]) {
             var otherKind = requestedTrackType === "audio" ? "video" : "audio";
             if (__qeEffectByName(otherKind, effectName)) {
-              return __refuse("Effect " + effectName + " is only a " + otherKind + " effect and cannot be applied to an " + requestedTrackType + " track. No mutation was attempted.");
+              return __refuse("Effect " + effectName + " is only a" + (otherKind === "audio" ? "n audio" : " video") + " effect and cannot be applied to a" + (requestedTrackType === "audio" ? "n audio" : " video") + " track's clips. No mutation was attempted." + (otherKind === "audio" ? " Use track_type audio, or add_audio_track_effect for an Audio Track Mixer insert." : ""));
             }
             return __refuse("Effect not found: " + effectName);
           }
@@ -905,6 +905,7 @@ export function getClipboardTools(bridgeOptions: BridgeOptions) {
 
           var targets = [];
           var selectedIncompatible = 0;
+          var incompatibleByKind = { video: 0, audio: 0 };
 
           function collectTracks(tracks, trackType, selectedOnly, onlyTrackIndex) {
             for (var t = 0; t < tracks.numTracks; t++) {
@@ -913,6 +914,7 @@ export function getClipboardTools(bridgeOptions: BridgeOptions) {
                 var clip = tracks[t].clips[c];
                 if (selectedOnly && !clip.isSelected()) continue;
                 if (!effectsByKind[trackType]) {
+                  incompatibleByKind[trackType]++;
                   if (selectedOnly) selectedIncompatible++;
                   continue;
                 }
@@ -998,11 +1000,15 @@ export function getClipboardTools(bridgeOptions: BridgeOptions) {
             receipt.applied = applied;
             receipt.targets = targets.length;
             receipt.failures = failures;
+            receipt.incompatibleByKind = incompatibleByKind;
             return __error("Batch effect application was only partially verified (" + applied + "/" + targets.length + "). Do not retry blindly; inspect Effect Controls. Failures: " + failures.join("; "), receipt);
           }
 
           var effectType = appliedByKind.video && appliedByKind.audio ? "video+audio" : (appliedByKind.audio ? "audio" : "video");
-          return __result({ applied: applied, appliedByKind: appliedByKind, verified: true, effect: effectName, effectType: effectType, target: target, scope: "per_clip", selectedIncompatible: selectedIncompatible });
+          var skipNote = incompatibleByKind.video || incompatibleByKind.audio
+            ? "Skipped " + incompatibleByKind.video + " video and " + incompatibleByKind.audio + " audio clip(s): " + effectName + " is not available as an effect of their kind."
+            : undefined;
+          return __result({ applied: applied, appliedByKind: appliedByKind, verified: true, outcome: "verified", effect: effectName, effectType: effectType, target: target, scope: "per_clip", selectedIncompatible: selectedIncompatible, incompatibleByKind: incompatibleByKind, note: skipNote });
         `);
         return sendCommand(script, bridgeOptions);
       },
