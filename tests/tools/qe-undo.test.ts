@@ -145,6 +145,33 @@ describe("an undo that moves the stack unexpectedly is never reported as nothing
     expect(JSON.stringify(result)).not.toContain("Nothing to undo");
   });
 
+  // Live Premiere 27.0: an audio track insert recorded two entries (3 -> 5) and one undo took the stack back to 3.
+  it.each([
+    ["one step that moves two entries", 2],
+    ["two steps of one entry", 1],
+  ])("undo_to_stack_index lands on the target through %s", async (_label, entriesPerStep) => {
+    const stack = undoHost(5, 5, { undo: () => { stack.index -= entriesPerStep; return true; } });
+    await expect(project.undo.handler({ expected_undo_stack_index: 5, undo_to_stack_index: 3 })).resolves.toMatchObject({
+      success: true,
+      data: { undone: 2 / entriesPerStep, undoStackIndexAfter: 3, stackStatus: "stack_verified", stackVerified: true },
+    });
+    expect(stack.index).toBe(3);
+  });
+
+  it("undo_to_stack_index stops on a step past the target", async () => {
+    const stack = undoHost(5, 5, { undo: () => { stack.index -= 3; return true; } });
+    await expect(project.undo.handler({ expected_undo_stack_index: 5, undo_to_stack_index: 3 })).resolves.toMatchObject({
+      success: true,
+      data: { undone: 0, undoStackIndexAfter: 2, stackStatus: "moved_unexpectedly", outcome: "committed_unverified", stackVerified: false },
+    });
+  });
+
+  it("refuses an undo_to_stack_index that is not below the guard", async () => {
+    await expect(project.undo.handler({ expected_undo_stack_index: 5, undo_to_stack_index: 5 }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining("below expected_undo_stack_index") });
+    expect(mockedSendCommand).not.toHaveBeenCalled();
+  });
+
   it("a move the wrong way is committed_unverified", async () => {
     const stack = undoHost(10, 20, { undo: () => { stack.index += 1; return true; } });
     await expect(targeting.multiple_undo.handler({ count: 2, expected_undo_stack_index: 10 })).resolves.toMatchObject({

@@ -2015,6 +2015,7 @@ describe("audio track inserts", () => {
     noAdd?: boolean;
     noRemove?: boolean;
     removeNoop?: boolean;
+    slotNames?: boolean;
     undo?: number[];
     audioEffects?: string[];
     videoEffects?: string[];
@@ -2032,7 +2033,7 @@ describe("audio track inserts", () => {
       ...(options.noAdd ? {} : { addAudioEffect: (effect: { name: string }) => {
         calls.push(`add:${effect.name}`);
         if (options.addThrows) throw new Error("slots full");
-        if (!options.addNoop) list.push(effect.name);
+        if (!options.addNoop) list.push(options.slotNames ? `Fx Slot ${list.filter((name) => name.startsWith("Fx Slot ")).length + 1}: ${effect.name}` : effect.name);
       } }),
     };
     if (options.numComponents !== false) Object.defineProperty(qeTrack, "numComponents", { get: () => list.length });
@@ -2056,10 +2057,13 @@ describe("audio track inserts", () => {
   }
 
   it.each([true, false])("lists a track's components (numComponents %s)", async (numComponents) => {
-    trackHost({ components: ["Volume", "Highpass"], numComponents });
+    trackHost({ components: ["Volume", "Fx Slot 1: Highpass"], numComponents });
     await expect(effects.list_audio_track_effects.handler({ track_index: 0 })).resolves.toMatchObject({
       success: true,
-      data: { trackName: "A1", count: 2, countSource: numComponents ? "numComponents" : "getComponentAt", components: [{ index: 0, name: "Volume", builtIn: true }, { index: 1, name: "Highpass", builtIn: false }] },
+      data: {
+        trackName: "A1", count: 2, countSource: numComponents ? "numComponents" : "getComponentAt",
+        components: [{ index: 0, name: "Volume", effectName: "Volume", slot: null, builtIn: true }, { index: 1, name: "Fx Slot 1: Highpass", effectName: "Highpass", slot: 1, builtIn: false }],
+      },
     });
   });
 
@@ -2070,6 +2074,21 @@ describe("audio track inserts", () => {
       data: { verified: true, outcome: "verified", scope: "track", addedComponent: { index: 2, name: "Highpass" } },
     });
     expect(host.list).toEqual(["Volume", "Balance", "Highpass"]);
+  });
+
+  // Live Premiere 27.0: the add moved the undo stack 3 -> 5, and one undo took it back to 3.
+  it("reports the add's undo-stack entries and an undo hint that lands before it", async () => {
+    const host = trackHost({ components: ["Track", ""], slotNames: true, undo: [3, 5] });
+    await expect(addInsert({ track_index: 0, effect_name: "Highpass" })).resolves.toMatchObject({
+      success: true,
+      data: {
+        outcome: "verified",
+        addedComponent: { index: 2, name: "Fx Slot 1: Highpass", effectName: "Highpass", slot: 1 },
+        undoStackEntries: 2,
+        undo: { tool: "undo", expected_undo_stack_index: 5, undo_to_stack_index: 3, stackEntries: 2 },
+      },
+    });
+    expect(host.list).toEqual(["Track", "", "Fx Slot 1: Highpass"]);
   });
 
   it.each([
@@ -2119,6 +2138,17 @@ describe("audio track inserts", () => {
     expect(host.calls).toEqual(["remove:Highpass"]);
   });
 
+  it.each([
+    ["the effect name the add took", "Highpass", undefined],
+    ["the full component name", "Fx Slot 1: Highpass", undefined],
+    ["the effect name at an index", "Highpass", 2],
+  ] as const)("removes a slotted insert by %s", async (_label, name, index) => {
+    const host = trackHost({ components: ["Track", "", "Fx Slot 1: Highpass"] });
+    await expect(removeInsert({ track_index: 0, effect_name: name, index }))
+      .resolves.toMatchObject({ success: true, data: { verified: true, index: 2, slot: 1, effect: "Highpass", component: "Fx Slot 1: Highpass", remaining: ["Track", ""] } });
+    expect(host.calls).toEqual(["remove:Fx Slot 1: Highpass"]);
+  });
+
   it("removes the insert at a given index", async () => {
     const host = trackHost({ components: ["Volume", "Highpass", "Highpass"] });
     await expect(removeInsert({ track_index: 0, effect_name: "Highpass", index: 1 })).resolves.toMatchObject({ success: true, data: { index: 1 } });
@@ -2137,9 +2167,12 @@ describe("audio track inserts", () => {
     expect(host.calls).toEqual([]);
   });
 
-  it("reports an ignored removal as not applied", async () => {
-    trackHost({ components: ["Volume", "Highpass"], removeNoop: true });
-    await expect(removeInsert({ track_index: 0, effect_name: "Highpass" }))
-      .resolves.toMatchObject({ success: false, error: expect.stringContaining("ignored the removal"), data: { mutationOutcome: "not_applied" } });
+  it("reports an ignored removal as a capability error that changed nothing", async () => {
+    trackHost({ components: ["Track", "", "Fx Slot 1: Highpass"], removeNoop: true, undo: [5, 5] });
+    await expect(removeInsert({ track_index: 0, effect_name: "Highpass" })).resolves.toMatchObject({
+      success: false,
+      error: expect.stringMatching(/^Capability error: Premiere ignored QE remove\(\) on Fx Slot 1: Highpass.*Audio Track Mixer/),
+      data: { mutationOutcome: "not_applied", timelineChanged: false, capability: "track_insert_removal_unavailable" },
+    });
   });
 });

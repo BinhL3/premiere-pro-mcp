@@ -1719,6 +1719,28 @@ function __isBuiltInTrackComponentName(name) {
   return __BUILT_IN_COMPONENTS[name] === true || __INTRINSIC_AUDIO_DISPLAY_NAMES[name] === true;
 }
 
+// Premiere 27.0 names a track insert "Fx Slot <n>: <effect>"; other
+// components keep their own name and have no slot.
+function __trackInsertParts(name) {
+  var match = /^Fx Slot (\\d+): ([\\s\\S]*)$/.exec(String(name));
+  return match ? { slot: Number(match[1]), effectName: match[2] } : { slot: null, effectName: String(name) };
+}
+
+// A component name answers to its full name and to the effect name inside it.
+function __trackInsertNameMatches(componentName, wanted) {
+  return componentName === wanted || __trackInsertParts(componentName).effectName === wanted;
+}
+
+// How to reverse a track-insert command with the undo tool. One QE track
+// insert recorded two undo-stack entries on Premiere 27.0 and a single undo
+// reversed both, so the hint names the stack index to land on, not a count.
+function __trackUndoHint() {
+  if (__undoStart === null) return null;
+  var undoNow = __readUndoIndex();
+  if (undoNow === null || undoNow <= __undoStart) return null;
+  return { tool: "undo", expected_undo_stack_index: undoNow, undo_to_stack_index: __undoStart, stackEntries: undoNow - __undoStart };
+}
+
 // Receipt for a track-insert add or removal, read from QE before and after.
 // expected(added, removed) says whether the observed change is the promised
 // one. Unchanged components are not_applied unless the undo stack moved.
@@ -2749,7 +2771,11 @@ function __markerUndoBarrier(direction, count, index, acknowledged) {
 // different amount or the wrong way), "index_unreadable" (a step ran but the
 // index could not be read), or "rejected" (Premiere threw). The last three may
 // have changed the project and must not be treated as "nothing happened".
-function __qeUndoSteps(direction, count, acknowledgeMarkers) {
+// target (undo only, optional) is the index to land on: each step may then
+// move by several entries, as one track insert's undo does on Premiere 27.0,
+// but must move down and never past target; it stops there.
+function __qeUndoSteps(direction, count, acknowledgeMarkers, target) {
+  var hasTarget = direction === "undo" && typeof target === "number";
   app.enableQE();
   var stack = null;
   try { stack = qe.project; } catch (eQe) {}
@@ -2759,7 +2785,8 @@ function __qeUndoSteps(direction, count, acknowledgeMarkers) {
   };
   var start = readIndex();
   if (start === null) return { ok: false, status: "unavailable", error: "This Premiere host does not expose qe.project.undoStackIndex(), so " + direction + " cannot be checked. No " + direction + " was attempted.", done: 0 };
-  var markerBarrier = __markerUndoBarrier(direction, count, start, acknowledgeMarkers === true);
+  if (hasTarget && target >= start) return { ok: false, status: "rejected", error: "undo_to_stack_index " + target + " is not below Premiere's undo-stack position " + start + ". No undo was attempted.", done: 0, startIndex: start, index: start };
+  var markerBarrier = __markerUndoBarrier(direction, hasTarget ? start - target : count, start, acknowledgeMarkers === true);
   if (!markerBarrier.ok) return { ok: false, status: "marker_boundary", error: markerBarrier.error, done: 0, startIndex: start, index: start };
   var step = direction === "undo" ? -1 : 1;
   var done = 0;
@@ -2788,12 +2815,18 @@ function __qeUndoSteps(direction, count, acknowledgeMarkers) {
         error: direction + " step " + (i + 1) + " ran, but Premiere's undo-stack index could not be read afterwards, so it is not known what changed. Do not retry; inspect the project." };
     }
     if (next === index) break;
-    if (next !== index + step) {
+    if (hasTarget ? (next >= index || next < target) : next !== index + step) {
       return { ok: false, status: "moved_unexpectedly", done: done, startIndex: start, index: next,
-        error: direction + " step " + (i + 1) + " moved Premiere's undo stack from " + index + " to " + next + " instead of " + (index + step) + ", so more or other actions than requested may have been " + direction + "ne. Do not retry; inspect the project." };
+        error: direction + " step " + (i + 1) + " moved Premiere's undo stack from " + index + " to " + next + " instead of " + (hasTarget ? "toward " + target : index + step) + ", so more or other actions than requested may have been " + direction + "ne. Do not retry; inspect the project." };
     }
     index = next;
     done++;
+    if (hasTarget && index === target) break;
+  }
+  if (hasTarget) {
+    if (index === target) return { ok: true, status: "stack_verified", targetReached: true, markerWarning: markerBarrier.warning || null, done: done, startIndex: start, index: index };
+    return { ok: false, status: "did_not_move", done: done, startIndex: start, index: index,
+      error: done === 0 ? "Nothing to undo: Premiere's undo stack did not move." : "The undo stack stopped at " + index + " after " + done + " step(s), short of undo_to_stack_index " + target + "." };
   }
   if (done < count) {
     return {
@@ -2827,7 +2860,9 @@ function __undoStepsResult(outcome, doneKey) {
   }
   if (!outcome.ok) return __jsonStringify({ success: false, error: outcome.error, data: summary });
   summary.stackVerified = true;
-  summary.verification = "undo-stack position only: each step moved qe.project.undoStackIndex() by one; the timeline is not read back";
+  summary.verification = outcome.targetReached
+    ? "undo-stack position only: the steps moved qe.project.undoStackIndex() down to exactly the requested index; the timeline is not read back"
+    : "undo-stack position only: each step moved qe.project.undoStackIndex() by one; the timeline is not read back";
   return __result(summary);
 }
 

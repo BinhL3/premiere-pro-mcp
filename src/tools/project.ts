@@ -225,13 +225,17 @@ export function getProjectTools(bridgeOptions: BridgeOptions) {
     undo: {
       description:
         "EXPERIMENTAL (undocumented QE DOM: qe.project.undo / undoStackIndex). Undo the most recent Premiere project action(s) through QE, checked step by step against Premiere's undo-stack position (stackVerified; the timeline itself is not read back). Undo history is project-wide." +
-        " Only actions Premiere records are undoable: QE edits such as razor, insert, lift and extract report undoSteps (and undoStackIndex) in their results; pass that undoSteps as count to reverse exactly that call. A marker receipt with undoTracked:false recorded no undo step: calling Undo for it would reverse an earlier action. Only CEP tool results carry undoSteps; UXP tools and workflows that send several commands are not counted. Always pass expected_undo_stack_index to check the stack position, but matching position alone does not prove which action is on top. Observed marker boundaries refuse the entire request before any step unless acknowledge_untracked_markers:true explicitly permits prior non-marker actions. The barrier persists through server/helper reloads while the CEP engine remains alive; it cannot account for marker writes before observation, after an engine reset, or through UXP, the manual UI, or other clients. Matching the QE index verifies stack position only.",
+        " Only actions Premiere records are undoable: QE edits such as razor, insert, lift and extract report undoSteps (and undoStackIndex) in their results; pass that undoSteps as count to reverse exactly that call. When a result carries an undo hint with undo_to_stack_index (add_audio_track_effect: one Premiere 27.0 undo reversed its two stack entries together), pass that hint's expected_undo_stack_index and undo_to_stack_index instead of a count. A marker receipt with undoTracked:false recorded no undo step: calling Undo for it would reverse an earlier action. Only CEP tool results carry undoSteps; UXP tools and workflows that send several commands are not counted. Always pass expected_undo_stack_index to check the stack position, but matching position alone does not prove which action is on top. Observed marker boundaries refuse the entire request before any step unless acknowledge_untracked_markers:true explicitly permits prior non-marker actions. The barrier persists through server/helper reloads while the CEP engine remains alive; it cannot account for marker writes before observation, after an engine reset, or through UXP, the manual UI, or other clients. Matching the QE index verifies stack position only.",
       parameters: {
         type: "object" as const,
         properties: {
           count: {
             type: "number",
             description: "Number of times to undo (default: 1)",
+          },
+          undo_to_stack_index: {
+            type: "number",
+            description: "Optional: the undo-stack index to land on, from a result's undo hint (below expected_undo_stack_index). Steps may then move by several entries but must stop exactly there; count defaults to the entries between and caps the steps.",
           },
           acknowledge_untracked_markers: {
             type: "boolean",
@@ -245,14 +249,22 @@ export function getProjectTools(bridgeOptions: BridgeOptions) {
         },
         required: ["expected_undo_stack_index"],
       },
-      handler: async (args: { count?: number; expected_undo_stack_index?: number; acknowledge_untracked_markers?: boolean }) => {
-        const count = args.count ?? 1;
-        if (!Number.isInteger(count) || count < 1 || count > 100) {
+      handler: async (args: { count?: number; expected_undo_stack_index?: number; undo_to_stack_index?: number; acknowledge_untracked_markers?: boolean }) => {
+        const validCount = (value: number) => Number.isInteger(value) && value >= 1 && value <= 100;
+        if (args.count !== undefined && !validCount(args.count)) {
           return { success: false, error: "count must be an integer from 1 through 100" };
         }
         const guardArg = args.expected_undo_stack_index;
         if (!Number.isInteger(guardArg) || guardArg! < 0) {
           return { success: false, error: "expected_undo_stack_index is required and must be a non-negative integer; undo was not attempted" };
+        }
+        const target = args.undo_to_stack_index;
+        if (target !== undefined && (!Number.isInteger(target) || target < 0 || target >= guardArg!)) {
+          return { success: false, error: "undo_to_stack_index must be a non-negative integer below expected_undo_stack_index; undo was not attempted" };
+        }
+        const count = args.count ?? (target === undefined ? 1 : guardArg! - target);
+        if (!validCount(count)) {
+          return { success: false, error: "undo_to_stack_index is more than 100 entries below expected_undo_stack_index; undo was not attempted" };
         }
         const guard = String(guardArg);
         const script = buildToolScript(`
@@ -267,7 +279,7 @@ export function getProjectTools(bridgeOptions: BridgeOptions) {
               return __jsonStringify({ success: false, error: "Premiere's undo stack is at " + currentIndex + ", not the expected " + expectedIndex + ": the undo-stack position changed since that call (actions were undone or recorded), so undo was not attempted.", data: { undoStackIndex: currentIndex, expectedUndoStackIndex: expectedIndex, mutationOutcome: "not_applied", timelineChanged: false } });
             }
           }
-          var outcome = __qeUndoSteps("undo", ${count}, ${args.acknowledge_untracked_markers === true ? "true" : "false"});
+          var outcome = __qeUndoSteps("undo", ${count}, ${args.acknowledge_untracked_markers === true ? "true" : "false"}, ${target === undefined ? "null" : target});
           return __undoStepsResult(outcome, "undone");
         `);
         return sendCommand(script, bridgeOptions);
