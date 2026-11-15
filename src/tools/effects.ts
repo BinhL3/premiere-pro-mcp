@@ -84,10 +84,11 @@ function applyEffectWithReadback(kind: "Video" | "Audio"): string {
 /** ES3 prelude resolving QE audio track `trackIndex` for the track-insert tools. */
 function audioTrackPrelude(trackIndex: number): string {
   return `
-    app.enableQE();
+    try { app.enableQE(); } catch (eEnableQe) { return __refuse("Capability error: the QE DOM is unavailable (" + eEnableQe + "); nothing was changed."); }
     var seq = app.project.activeSequence;
     if (!seq) return __refuse("No active sequence");
-    var qeSeq = qe.project.getActiveSequence();
+    var qeSeq = null;
+    try { qeSeq = qe.project.getActiveSequence(); } catch (eQeSeq) {}
     if (!qeSeq) return __refuse("No active sequence (QE)");
     var trackIndex = ${trackIndex};
     if (trackIndex >= seq.audioTracks.numTracks) return __refuse("Audio track index " + trackIndex + " is out of range; the sequence has " + seq.audioTracks.numTracks + " audio track(s).");
@@ -110,6 +111,13 @@ const TRACK_INDEX_PARAMETER = {
 
 function invalidTrackIndex(value: unknown): boolean {
   return !Number.isInteger(value) || (value as number) < 0;
+}
+
+// Audio Track Mixer insert slots per track, numbered 1-5 as Premiere shows them.
+const TRACK_INSERT_SLOTS = 5;
+
+function invalidInsertSlot(value: unknown): boolean {
+  return !Number.isInteger(value) || (value as number) < 1 || (value as number) > TRACK_INSERT_SLOTS;
 }
 
 export function getEffectsTools(bridgeOptions: BridgeOptions) {
@@ -339,7 +347,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
     },
 
     list_audio_track_effects: {
-      description: "List an audio track's Audio Track Mixer components (track inserts such as an added Highpass, plus any components the track itself carries), read through the undocumented QE DOM's track getComponentAt(). EXPERIMENTAL. Each component has its full name (Premiere 27.0 names an insert 'Fx Slot 1: Highpass'), the plain effectName inside it, and its insert slot (null for components that are not inserts). builtIn marks names this server never removes. These are track-level, not clip effects; use list_clip_effects for a clip.",
+      description: "List an audio track's Audio Track Mixer components (track inserts such as an added Highpass, plus any components the track itself carries), read through the undocumented QE DOM's track getComponentAt(). EXPERIMENTAL. Each component has its full name (Premiere 27.0 names an insert 'Fx Slot 1: Highpass'), the plain effectName inside it, its insert slot (1-5, null for components that are not inserts), params (the QE parameter names, e.g. ['Bypass', 'Cutoff'], null when unreadable), and bypassed (its Bypass parameter, null when unavailable). freeSlots lists the empty insert slots. builtIn marks names this server never removes. These are track-level, not clip effects; use list_clip_effects for a clip.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -356,16 +364,22 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           var components = [];
           for (var i = 0; i < read.names.length; i++) {
             var parts = __trackInsertParts(read.names[i]);
-            components.push({ index: i, name: read.names[i], effectName: parts.effectName, slot: parts.slot, builtIn: __isBuiltInTrackComponentName(parts.effectName) });
+            var component = null;
+            try { component = qeTrack.getComponentAt(i); } catch (eAt) {}
+            var state = __trackInsertParams(component);
+            components.push({ index: i, name: read.names[i], effectName: parts.effectName, slot: parts.slot, builtIn: __isBuiltInTrackComponentName(parts.effectName), params: state.params, bypassed: state.bypassed });
           }
-          return __result({ trackIndex: trackIndex, trackName: trackName, count: read.names.length, countSource: read.countSource, components: components, scope: "track" });
+          var slots = __trackInsertSlots(read.names);
+          var freeSlots = [];
+          for (var s = 1; s <= __TRACK_INSERT_SLOTS; s++) if (slots[s] === undefined) freeSlots.push(s);
+          return __result({ trackIndex: trackIndex, trackName: trackName, count: read.names.length, countSource: read.countSource, components: components, insertSlots: __TRACK_INSERT_SLOTS, freeSlots: freeSlots, scope: "track" });
         `);
         return sendCommand(script, bridgeOptions);
       },
     },
 
     add_audio_track_effect: {
-      description: "Add an audio effect as a track insert on one audio track (an Audio Track Mixer effect slot, applied to everything on the track), not to its clips. EXPERIMENTAL: uses the undocumented QE DOM's audio track addAudioEffect(), resolving the name among audio effects only, and verifies by reading the track's QE components back (not rendered audio). Script removal is not available: on Premiere 27.0 QE ignores remove() on track inserts, so remove the insert by hand in the Audio Track Mixer, or reverse this call with undo. The add records more than one undo-stack entry (two on Premiere 27.0, and a single undo reversed both), so do not pass undoSteps as an undo count: pass the result's undo hint (expected_undo_stack_index and undo_to_stack_index) to the undo tool, which lands exactly on the index before the add. undoStackEntries reports the entries recorded. For per-clip effects use apply_audio_effect or batch_apply_effect.",
+      description: "Add an audio effect as a track insert on one audio track (an Audio Track Mixer effect slot, applied to everything on the track), not to its clips. EXPERIMENTAL: uses the undocumented QE DOM's audio track addAudioEffect(effect, slotIndex, false) (the third argument's meaning is unknown and is always false), resolving the name among audio effects only, and verifies by reading the track's QE components back (not rendered audio). A track has five insert slots and audio flows through them in slot order. Without slot, the effect goes in the first free slot, so build a chain by adding in signal order (Highpass, then DeNoise, then Parametric Equalizer) without passing slot. A slot that already holds an insert is refused unless replace: true, which replaces that insert (Premiere's own behavior for an occupied slot); a track with all five slots full is refused with nothing changed. Verified means the effect reads back as 'Fx Slot <slot>: <name>' and nothing else on the track changed. To switch an insert off without removing it, use set_audio_track_effect_bypass. Script removal is not available: on Premiere 27.0 QE ignores remove() on track inserts, so remove the insert by hand in the Audio Track Mixer, or reverse this call with undo. Do not pass undoSteps as an undo count (one Premiere 27.0 add recorded two stack entries that a single undo reversed): pass the result's undo hint (expected_undo_stack_index and undo_to_stack_index) to the undo tool, which lands exactly on the index before the add. undoStackEntries reports the entries recorded. For per-clip effects use apply_audio_effect or batch_apply_effect.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -374,29 +388,60 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
             type: "string",
             description: "Display name of the audio effect (e.g., 'Highpass', 'DeNoise', 'Parametric Equalizer')",
           },
+          slot: {
+            type: "number",
+            description: "Optional insert slot 1-5, as the Audio Track Mixer numbers them. Omit to use the first free slot (the usual choice when building a chain in order).",
+          },
+          replace: {
+            type: "boolean",
+            description: "Replace the insert already in slot. Required to add into an occupied slot; without it an occupied slot is refused with nothing changed. Default false.",
+          },
         },
         required: ["track_index", "effect_name"],
       },
-      handler: async (args: { track_index: number; effect_name: string }) => {
+      handler: async (args: { track_index: number; effect_name: string; slot?: number; replace?: boolean }) => {
         if (invalidTrackIndex(args.track_index)) return { success: false, error: "track_index must be a non-negative integer" };
         if (typeof args.effect_name !== "string" || !args.effect_name.trim()) return { success: false, error: "effect_name must not be empty" };
+        if (args.slot !== undefined && invalidInsertSlot(args.slot)) return { success: false, error: `slot must be an integer from 1 to ${TRACK_INSERT_SLOTS}` };
+        if (args.replace !== undefined && typeof args.replace !== "boolean") return { success: false, error: "replace must be a boolean" };
         const script = buildToolScript(`
           ${audioTrackPrelude(args.track_index)}
           var effectName = "${escapeForExtendScript(args.effect_name)}";
-          if (typeof qeTrack.addAudioEffect !== "function") return __refuse("Capability error: this Premiere build's QE audio track has no addAudioEffect(); nothing was changed.");
+          var requestedSlot = ${args.slot === undefined ? "null" : args.slot};
+          var replace = ${args.replace === true};
+          var canAdd = false;
+          try { canAdd = typeof qeTrack.addAudioEffect === "function"; } catch (eCanAdd) {}
+          if (!canAdd) return __refuse("Capability error: this Premiere build's QE audio track has no addAudioEffect(); nothing was changed.");
           var before = __qeTrackComponents(qeTrack);
           if (!before) return __refuse("Capability error: QE cannot list audio track " + trackIndex + "'s components, so a track insert could not be verified; nothing was changed.");
+          var slots = __trackInsertSlots(before.names);
+          var slot = requestedSlot;
+          if (slot === null) {
+            for (var s = 1; s <= __TRACK_INSERT_SLOTS; s++) if (slots[s] === undefined) { slot = s; break; }
+            if (slot === null) return __refuse("All " + __TRACK_INSERT_SLOTS + " insert slots of audio track " + trackIndex + " are full (" + before.names.join(", ") + "). Nothing was changed. Pass slot with replace: true to replace one insert.", { slots: slots });
+          }
+          var replacing = slots[slot] !== undefined ? slots[slot] : null;
+          if (replacing !== null && !replace) return __refuse("Slot " + slot + " of audio track " + trackIndex + " already holds " + replacing + ". Nothing was changed. Omit slot to use the first free slot, or pass replace: true to replace it.", { slot: slot, occupiedBy: replacing });
+          if (replacing !== null && __trackInsertParts(replacing).effectName === effectName) return __refuse("Slot " + slot + " of audio track " + trackIndex + " already holds " + effectName + "; replacing an insert with the same effect changes nothing in Premiere, so nothing was done.", { slot: slot, occupiedBy: replacing });
           var effect = __qeEffectByName("audio", effectName);
           if (!effect) {
             if (__qeEffectByName("video", effectName)) return __refuse(effectName + " is a video effect, not an audio effect; nothing was changed.");
             return __refuse("Audio effect not found: " + effectName + ". Nothing was changed.");
           }
+          var expectedName = "Fx Slot " + slot + ": " + effectName;
           var addError = "";
-          try { qeTrack.addAudioEffect(effect); } catch (eAdd) { addError = String(eAdd); }
-          var receipt = __trackComponentReceipt(before, __qeTrackComponents(readQeTrack()), addError !== "", function (added, removed) { return added.length === 1 && removed.length === 0; });
+          // Premiere 27.0: arg 2 is the 0-based slot (one arg means slot 0, replacing
+          // what is there); arg 3's meaning is unmeasured and false is what was tested.
+          try { qeTrack.addAudioEffect(effect, slot - 1, false); } catch (eAdd) { addError = String(eAdd); }
+          var receipt = __trackComponentReceipt(before, __qeTrackComponents(readQeTrack()), addError !== "", function (added, removed) {
+            if (added.length !== 1 || added[0] !== expectedName) return false;
+            return replacing === null ? removed.length === 0 : removed.length === 1 && removed[0] === replacing;
+          });
           if (addError) receipt.hostError = addError;
           receipt.trackIndex = trackIndex;
           receipt.effect = effectName;
+          receipt.slot = slot;
+          receipt.replaced = replacing;
           receipt.scope = "track";
           receipt.undoStackEntries = receipt.evidence.undoSteps;
           var undoHint = __trackUndoHint();
@@ -404,20 +449,141 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           if (receipt.mutationOutcome === "verified") {
             receipt.verified = true;
             receipt.outcome = "verified";
-            var addedParts = __trackInsertParts(receipt.evidence.added[0]);
-            receipt.addedComponent = { index: receipt.evidence.after.length - 1, name: receipt.evidence.added[0], effectName: addedParts.effectName, slot: addedParts.slot };
+            var addedIndex = -1;
+            for (var a = 0; a < receipt.evidence.after.length; a++) if (receipt.evidence.after[a] === expectedName) { addedIndex = a; break; }
+            receipt.addedComponent = { index: addedIndex, name: expectedName, effectName: effectName, slot: slot };
             receipt.verificationScope = "QE track component readback only; verify rendered audio before delivery.";
             return __result(receipt);
           }
-          if (receipt.mutationOutcome === "not_applied") return __error("Premiere added no insert to audio track " + trackIndex + (addError ? " (" + addError + ")" : "") + "; the track's components are unchanged. Its insert slots may be full.", receipt);
-          return __error("Adding " + effectName + " to audio track " + trackIndex + " was not verified" + (receipt.uncertainty ? ": " + receipt.uncertainty : "; the track's components changed unexpectedly.") + " Inspect the Audio Track Mixer before any retry.", receipt);
+          if (receipt.mutationOutcome === "not_applied") return __error("Premiere added no insert to slot " + slot + " of audio track " + trackIndex + (addError ? " (" + addError + ")" : "") + "; the track's components are unchanged.", receipt);
+          return __error("Adding " + effectName + " to slot " + slot + " of audio track " + trackIndex + " was not verified" + (receipt.uncertainty ? ": " + receipt.uncertainty : "; the track's components changed differently than expected (wanted " + expectedName + (replacing ? " in place of " + replacing : "") + ").") + " Inspect the Audio Track Mixer before any retry.", receipt);
+        `);
+        return sendCommand(script, bridgeOptions);
+      },
+    },
+
+    set_audio_track_effect_bypass: {
+      description: "Bypass (switch off) or re-enable one track insert on an audio track, leaving it in its Audio Track Mixer slot. EXPERIMENTAL: uses the undocumented QE DOM's track component setParamValue('Bypass', 'true'|'false', '0') and verifies by reading getParamValue('Bypass') back (not rendered audio). This is the in-tool way to take an insert out of the signal, since script removal does not work on Premiere 27.0. Name the insert by slot (1-5, from list_audio_track_effects) or by effect_name; give slot when the name appears in more than one slot. An insert whose QE params lack Bypass is a capability error with nothing changed. An insert already in the requested state is reported verified with changed: false and no host call. Reverse it by calling this again with the opposite value, or with undo and the result's undo hint.",
+      parameters: {
+        type: "object" as const,
+        properties: {
+          track_index: TRACK_INDEX_PARAMETER,
+          slot: {
+            type: "number",
+            description: "Insert slot 1-5 as list_audio_track_effects reports it. Give slot, effect_name, or both (then they must agree).",
+          },
+          effect_name: {
+            type: "string",
+            description: "Effect name of the insert ('Highpass') or its full component name ('Fx Slot 1: Highpass'). Refused as ambiguous when it is in more than one slot.",
+          },
+          bypassed: {
+            type: "boolean",
+            description: "true bypasses the insert; false re-enables it",
+          },
+        },
+        required: ["track_index", "bypassed"],
+      },
+      handler: async (args: { track_index: number; slot?: number; effect_name?: string; bypassed: boolean }) => {
+        if (invalidTrackIndex(args.track_index)) return { success: false, error: "track_index must be a non-negative integer" };
+        if (args.slot !== undefined && invalidInsertSlot(args.slot)) return { success: false, error: `slot must be an integer from 1 to ${TRACK_INSERT_SLOTS}` };
+        if (args.effect_name !== undefined && (typeof args.effect_name !== "string" || !args.effect_name.trim())) return { success: false, error: "effect_name must not be empty" };
+        if (args.slot === undefined && args.effect_name === undefined) return { success: false, error: "Give slot or effect_name to name the insert" };
+        if (typeof args.bypassed !== "boolean") return { success: false, error: "bypassed must be a boolean" };
+        const script = buildToolScript(`
+          ${audioTrackPrelude(args.track_index)}
+          var wantedSlot = ${args.slot === undefined ? "null" : args.slot};
+          var effectName = ${args.effect_name === undefined ? "null" : `"${escapeForExtendScript(args.effect_name)}"`};
+          var bypassed = ${args.bypassed};
+          var bypassValue = "${args.bypassed ? "true" : "false"}";
+          var wanted = wantedSlot !== null ? "slot " + wantedSlot + (effectName !== null ? " (" + effectName + ")" : "") : effectName;
+          var before = __qeTrackComponents(qeTrack);
+          if (!before) return __refuse("Capability error: QE cannot list audio track " + trackIndex + "'s components; nothing was changed.");
+          var matches = [];
+          for (var i = 0; i < before.names.length; i++) {
+            var parts = __trackInsertParts(before.names[i]);
+            if (parts.slot === null) continue;
+            if (wantedSlot !== null && parts.slot !== wantedSlot) continue;
+            if (effectName !== null && !__trackInsertNameMatches(before.names[i], effectName)) continue;
+            matches.push(i);
+          }
+          if (!matches.length) return __refuse("Audio track " + trackIndex + " has no track insert at " + wanted + "; its components are " + before.names.join(", ") + ". Nothing was changed.");
+          if (matches.length > 1) {
+            var inSlots = [];
+            for (var m = 0; m < matches.length; m++) inSlots.push(__trackInsertParts(before.names[matches[m]]).slot);
+            return __refuse("Audio track " + trackIndex + " has " + effectName + " in slots " + inSlots.join(", ") + "; pass slot to choose one. Nothing was changed.");
+          }
+          var at = matches[0];
+          var componentName = before.names[at];
+          var componentParts = __trackInsertParts(componentName);
+          var component = null;
+          var liveName = null;
+          try { component = qeTrack.getComponentAt(at); liveName = component ? String(component.name) : null; } catch (eAt) {}
+          if (liveName !== componentName) return __refuse("Audio track " + trackIndex + "'s component " + at + " no longer reads as " + componentName + "; nothing was changed.");
+          var receipt = { trackIndex: trackIndex, slot: componentParts.slot, effect: componentParts.effectName, component: componentName, index: at, scope: "track", bypassed: bypassed };
+          var state = __trackInsertParams(component);
+          if (!state.params) { receipt.capability = "track_insert_bypass_unavailable"; return __refuse("Capability error: QE exposes no readable getParamList() on " + componentName + ", so its Bypass cannot be set by script. Nothing was changed; toggle it in the Audio Track Mixer.", receipt); }
+          var hasBypass = false;
+          for (var p = 0; p < state.params.length; p++) if (state.params[p] === "Bypass") hasBypass = true;
+          receipt.params = state.params;
+          if (!hasBypass) { receipt.capability = "track_insert_bypass_unavailable"; return __refuse("Capability error: " + componentName + " has no Bypass parameter (its QE params are " + state.params.join(", ") + "). Nothing was changed; toggle it in the Audio Track Mixer.", receipt); }
+          var canSet = false;
+          try { canSet = typeof component.setParamValue === "function"; } catch (eCanSet) {}
+          if (!canSet) { receipt.capability = "track_insert_bypass_unavailable"; return __refuse("Capability error: QE exposes no setParamValue() on " + componentName + ". Nothing was changed; toggle it in the Audio Track Mixer.", receipt); }
+          if (state.bypassed === null) return __refuse("The Bypass state of " + componentName + " could not be read, so a change could not be verified. Nothing was changed.", receipt);
+          receipt.previouslyBypassed = state.bypassed;
+          if (state.bypassed === bypassed) {
+            receipt.changed = false;
+            receipt.verified = true;
+            receipt.outcome = "verified";
+            receipt.verificationScope = "QE getParamValue('Bypass') readback; no host call was made.";
+            return __result(receipt);
+          }
+          var setError = "";
+          var hostReturn = null;
+          // Premiere 27.0 throws "Illegal Parameter type" unless all three args are strings.
+          try { hostReturn = component.setParamValue("Bypass", bypassValue, "0"); } catch (eSet) { setError = String(eSet); }
+          var after = null;
+          try {
+            var trackAgain = readQeTrack();
+            var again = trackAgain ? trackAgain.getComponentAt(at) : null;
+            if (again && String(again.name) === componentName) after = __trackInsertParams(again).bypassed;
+          } catch (eAfter) { after = null; }
+          var undoNow = __undoStart !== null ? __readUndoIndex() : null;
+          var undoKnown = __undoStart !== null && undoNow !== null;
+          var undoMoved = undoKnown && undoNow !== __undoStart;
+          receipt.evidence = { before: state.bypassed, after: after, hostReturn: hostReturn === null || hostReturn === undefined ? null : String(hostReturn), undoSteps: undoKnown ? undoNow - __undoStart : null };
+          if (setError) receipt.hostError = setError;
+          var undoHint = __trackUndoHint();
+          if (undoHint) receipt.undo = undoHint;
+          if (after === bypassed) {
+            receipt.changed = true;
+            receipt.timelineChanged = true;
+            if (!setError) {
+              receipt.mutationOutcome = "verified";
+              receipt.verified = true;
+              receipt.outcome = "verified";
+              receipt.verificationScope = "QE getParamValue('Bypass') readback only; verify rendered audio before delivery.";
+              return __result(receipt);
+            }
+            receipt.mutationOutcome = "committed_unverified";
+            return __error("Premiere threw while setting Bypass on " + componentName + " (" + setError + "), but it reads back " + bypassValue + ". Inspect the Audio Track Mixer before relying on it.", receipt);
+          }
+          if (!undoMoved && (after === state.bypassed || (after === null && undoKnown))) {
+            receipt.mutationOutcome = "not_applied";
+            receipt.timelineChanged = false;
+            return __error("Premiere did not change Bypass on " + componentName + (setError ? " (" + setError + ")" : "") + "; it is still " + (state.bypassed ? "bypassed" : "active") + ". Nothing was changed.", receipt);
+          }
+          receipt.mutationOutcome = "unknown";
+          receipt.timelineChanged = null;
+          receipt.uncertainty = after === null ? "The Bypass state could not be read back after the call." : "Bypass reads back unchanged, but Premiere recorded " + (undoNow - __undoStart) + " undo step(s), so something else may have changed.";
+          return __error("Setting Bypass on " + componentName + " was not verified: " + receipt.uncertainty + " Inspect the Audio Track Mixer before any retry.", receipt);
         `);
         return sendCommand(script, bridgeOptions);
       },
     },
 
     remove_audio_track_effect: {
-      description: "Try to remove one track insert from an audio track (Audio Track Mixer effect slot) and verify by reading the track's QE components back. EXPERIMENTAL: uses the undocumented QE DOM's track getComponentAt(i).remove(). On Premiere 27.0 that remove() exists but is ignored, so this returns a capability error with nothing changed; remove the insert by hand in the Audio Track Mixer, or reverse add_audio_track_effect with undo and its undo hint. It verifies and succeeds only on a build where the removal really happens. Accepts the effect name the add took ('Highpass') or the full component name ('Fx Slot 1: Highpass'). Built-in track components are refused. Takes the last instance when names repeat unless index (from list_audio_track_effects) is given.",
+      description: "Try to remove one track insert from an audio track (Audio Track Mixer effect slot) and verify by reading the track's QE components back. EXPERIMENTAL: uses the undocumented QE DOM's track getComponentAt(i).remove(). On Premiere 27.0 that remove() exists but is ignored, so this returns a capability error with nothing changed. To take an insert out of the signal in-tool, bypass it with set_audio_track_effect_bypass; to really remove it, use the Audio Track Mixer by hand, or reverse add_audio_track_effect with undo and its undo hint. It verifies and succeeds only on a build where the removal really happens. Accepts the effect name the add took ('Highpass') or the full component name ('Fx Slot 1: Highpass'). Built-in track components are refused. Takes the last instance when names repeat unless index (from list_audio_track_effects) is given.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -456,7 +622,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           try { component = qeTrack.getComponentAt(at); } catch (eAt) {}
           var componentName = before.names[at];
           if (!component || String(component.name) !== componentName) return __refuse("Audio track " + trackIndex + "'s component " + at + " no longer reads as " + effectName + "; nothing was changed.");
-          if (typeof component.remove !== "function") return __refuse("Capability error: this Premiere build's QE exposes no remove() on audio track components, so track inserts cannot be removed by script. Nothing was changed; remove it in the Audio Track Mixer or undo the add.");
+          if (typeof component.remove !== "function") return __refuse("Capability error: this Premiere build's QE exposes no remove() on audio track components, so track inserts cannot be removed by script. Nothing was changed; bypass it with set_audio_track_effect_bypass, remove it in the Audio Track Mixer, or undo the add.", { capability: "track_insert_removal_unavailable" });
           var removeError = "";
           try { component.remove(); } catch (eRemove) { removeError = String(eRemove); }
           var receipt = __trackComponentReceipt(before, __qeTrackComponents(readQeTrack()), removeError !== "", function (added, removed) { return added.length === 0 && removed.length === 1 && removed[0] === componentName; });
@@ -477,7 +643,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           }
           if (receipt.mutationOutcome === "not_applied") {
             receipt.capability = "track_insert_removal_unavailable";
-            return __error("Capability error: Premiere " + (removeError ? "refused QE remove() (" + removeError + ")" : "ignored QE remove()") + " on " + componentName + ", so this build cannot remove audio track inserts by script; audio track " + trackIndex + "'s components are unchanged. Remove it by hand in the Audio Track Mixer, or reverse add_audio_track_effect with undo and its undo hint.", receipt);
+            return __error("Capability error: Premiere " + (removeError ? "refused QE remove() (" + removeError + ")" : "ignored QE remove()") + " on " + componentName + ", so this build cannot remove audio track inserts by script; audio track " + trackIndex + "'s components are unchanged. To switch it off in-tool, bypass it with set_audio_track_effect_bypass" + (receipt.slot !== null ? " (slot " + receipt.slot + ")" : "") + "; to remove it, use the Audio Track Mixer by hand, or reverse add_audio_track_effect with undo and its undo hint.", receipt);
           }
           return __error("Removing " + effectName + " from audio track " + trackIndex + " was not verified" + (receipt.uncertainty ? ": " + receipt.uncertainty : "; the track's components changed unexpectedly.") + " Inspect the Audio Track Mixer before any retry.", receipt);
         `);

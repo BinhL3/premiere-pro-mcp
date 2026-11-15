@@ -2006,39 +2006,69 @@ describe("audio track inserts", () => {
   // The server tracks undo for every edit call; refusals report not_applied only then.
   const addInsert = (args: Parameters<typeof effects.add_audio_track_effect.handler>[0]) => runWithUndoTracking(true, () => effects.add_audio_track_effect.handler(args));
   const removeInsert = (args: Parameters<typeof effects.remove_audio_track_effect.handler>[0]) => runWithUndoTracking(true, () => effects.remove_audio_track_effect.handler(args));
+  const setBypass = (args: Parameters<typeof effects.set_audio_track_effect_bypass.handler>[0]) => runWithUndoTracking(true, () => effects.set_audio_track_effect_bypass.handler(args));
 
   type TrackOptions = {
     components?: string[];
     numComponents?: boolean;
     addNoop?: boolean;
     addThrows?: boolean;
+    // Premiere 27.0 with one argument: the insert always lands in slot index 0.
+    ignoreSlotIndex?: boolean;
     noAdd?: boolean;
     noRemove?: boolean;
     removeNoop?: boolean;
-    slotNames?: boolean;
     undo?: number[];
     audioEffects?: string[];
     videoEffects?: string[];
+    bypassed?: Record<string, boolean>;
+    params?: string[] | "throws" | "none";
+    setNoop?: boolean;
+    setThrows?: boolean;
   };
 
+  // Mirrors the measured Premiere 27.0 QE audio track: inserts are named
+  // "Fx Slot <n>: <effect>", addAudioEffect(effect, slotIndex, flag) fills or
+  // replaces that slot, and setParamValue rejects non-string arguments.
   function trackHost(options: TrackOptions = {}) {
     const list = [...(options.components ?? ["Volume", "Balance"])];
     const calls: string[] = [];
     const undo = options.undo ? [...options.undo] : null;
+    const bypass = new Map(Object.entries(options.bypassed ?? {}));
+    const component = (name: string, index: number) => ({
+      name,
+      ...(options.noRemove ? {} : { remove: () => { calls.push(`remove:${name}`); if (!options.removeNoop) list.splice(index, 1); } }),
+      ...(options.params === "none" ? {} : {
+        getParamList: () => {
+          if (options.params === "throws") throw new Error("Illegal Parameter type");
+          return (options.params ?? ["Bypass", "Cutoff"]).join(",");
+        },
+        getParamValue: (param: string) => (param === "Bypass" ? String(bypass.get(name) ?? false) : "0"),
+        setParamValue: (...setArgs: unknown[]) => {
+          calls.push(`set:${setArgs.map((arg) => JSON.stringify(arg)).join(",")}`);
+          if (setArgs.length !== 3 || setArgs.some((arg) => typeof arg !== "string")) throw new Error("Illegal Parameter type");
+          if (options.setThrows) throw new Error("host refused");
+          if (!options.setNoop && setArgs[0] === "Bypass") bypass.set(name, setArgs[1] === "true");
+          return true;
+        },
+      }),
+    });
     const qeTrack: Record<string, unknown> = {
-      getComponentAt: (index: number) => (index < list.length ? {
-        name: list[index],
-        ...(options.noRemove ? {} : { remove: () => { calls.push(`remove:${list[index]}`); if (!options.removeNoop) list.splice(index, 1); } }),
-      } : null),
-      ...(options.noAdd ? {} : { addAudioEffect: (effect: { name: string }) => {
-        calls.push(`add:${effect.name}`);
+      getComponentAt: (index: number) => (index < list.length ? component(list[index], index) : null),
+      ...(options.noAdd ? {} : { addAudioEffect: (effect: { name: string }, slotIndex?: number) => {
+        calls.push(`add:${effect.name}@${slotIndex}`);
         if (options.addThrows) throw new Error("slots full");
-        if (!options.addNoop) list.push(options.slotNames ? `Fx Slot ${list.filter((name) => name.startsWith("Fx Slot ")).length + 1}: ${effect.name}` : effect.name);
+        if (options.addNoop) return true;
+        const slot = (options.ignoreSlotIndex ? 0 : slotIndex ?? 0) + 1;
+        const name = `Fx Slot ${slot}: ${effect.name}`;
+        const at = list.findIndex((existing) => existing.startsWith(`Fx Slot ${slot}: `));
+        if (at >= 0) list[at] = name; else list.push(name);
+        return true;
       } }),
     };
     if (options.numComponents !== false) Object.defineProperty(qeTrack, "numComponents", { get: () => list.length });
     const seq = { sequenceID: "s", audioTracks: { numTracks: 2, 0: { name: "A1" }, 1: { name: "A2" } }, videoTracks: { numTracks: 0 } };
-    const audio = options.audioEffects ?? ["Highpass"];
+    const audio = options.audioEffects ?? ["Highpass", "DeNoise", "Parametric Equalizer"];
     const video = options.videoEffects ?? [];
     mockedSendCommand.mockImplementation(async (script: string) => {
       const source = `${getHelpersSource()}\n${script}`;
@@ -2053,8 +2083,10 @@ describe("audio track inserts", () => {
         } },
       })));
     });
-    return { list, calls };
+    return { list, calls, bypass };
   }
+
+  const FULL = ["Track", "", "Fx Slot 1: Highpass", "Fx Slot 2: DeNoise", "Fx Slot 3: Parametric Equalizer", "Fx Slot 4: Highpass", "Fx Slot 5: DeNoise"];
 
   it.each([true, false])("lists a track's components (numComponents %s)", async (numComponents) => {
     trackHost({ components: ["Volume", "Fx Slot 1: Highpass"], numComponents });
@@ -2067,18 +2099,46 @@ describe("audio track inserts", () => {
     });
   });
 
-  it("adds a track insert and verifies it by QE readback", async () => {
+  it("lists each insert's params, bypass state and the free slots", async () => {
+    trackHost({ components: ["Track", "", "Fx Slot 1: Highpass", "Fx Slot 3: DeNoise"], bypassed: { "Fx Slot 3: DeNoise": true } });
+    await expect(effects.list_audio_track_effects.handler({ track_index: 0 })).resolves.toMatchObject({
+      success: true,
+      data: {
+        freeSlots: [2, 4, 5],
+        components: [
+          { name: "Track" }, { name: "" },
+          { name: "Fx Slot 1: Highpass", params: ["Bypass", "Cutoff"], bypassed: false },
+          { name: "Fx Slot 3: DeNoise", params: ["Bypass", "Cutoff"], bypassed: true },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    ["no getParamList()", "none"],
+    ["a throwing getParamList()", "throws"],
+    ["params without Bypass", ["Cutoff"]],
+  ] as const)("lists bypassed null for %s", async (_label, params) => {
+    trackHost({ components: ["Fx Slot 1: Highpass"], params: params === "none" || params === "throws" ? params : [...params] });
+    await expect(effects.list_audio_track_effects.handler({ track_index: 0 })).resolves.toMatchObject({
+      success: true,
+      data: { components: [{ params: params === "none" || params === "throws" ? null : ["Cutoff"], bypassed: null }] },
+    });
+  });
+
+  it("adds a track insert into the first slot and verifies it by QE readback", async () => {
     const host = trackHost();
     await expect(addInsert({ track_index: 0, effect_name: "Highpass" })).resolves.toMatchObject({
       success: true,
-      data: { verified: true, outcome: "verified", scope: "track", addedComponent: { index: 2, name: "Highpass" } },
+      data: { verified: true, outcome: "verified", scope: "track", slot: 1, replaced: null, addedComponent: { index: 2, name: "Fx Slot 1: Highpass", slot: 1 } },
     });
-    expect(host.list).toEqual(["Volume", "Balance", "Highpass"]);
+    expect(host.calls).toEqual(["add:Highpass@0"]);
+    expect(host.list).toEqual(["Volume", "Balance", "Fx Slot 1: Highpass"]);
   });
 
   // Live Premiere 27.0: the add moved the undo stack 3 -> 5, and one undo took it back to 3.
   it("reports the add's undo-stack entries and an undo hint that lands before it", async () => {
-    const host = trackHost({ components: ["Track", ""], slotNames: true, undo: [3, 5] });
+    const host = trackHost({ components: ["Track", ""], undo: [3, 5] });
     await expect(addInsert({ track_index: 0, effect_name: "Highpass" })).resolves.toMatchObject({
       success: true,
       data: {
@@ -2089,6 +2149,79 @@ describe("audio track inserts", () => {
       },
     });
     expect(host.list).toEqual(["Track", "", "Fx Slot 1: Highpass"]);
+  });
+
+  // Live Premiere 27.0: addAudioEffect(DeNoise, 1, false) on a track holding Highpass gave "Fx Slot 2: DeNoise".
+  it.each([
+    ["after the chain", ["Track", "", "Fx Slot 1: Highpass"], "add:DeNoise@1", 2],
+    ["in the first gap", ["Track", "", "Fx Slot 1: Highpass", "Fx Slot 3: Parametric Equalizer"], "add:DeNoise@1", 2],
+    ["in slot 1 when only later slots are taken", ["Track", "", "Fx Slot 2: Highpass"], "add:DeNoise@0", 1],
+  ] as const)("puts the effect in the first free slot %s", async (_label, components, call, slot) => {
+    const host = trackHost({ components: [...components] });
+    await expect(addInsert({ track_index: 0, effect_name: "DeNoise" })).resolves.toMatchObject({
+      success: true,
+      data: { outcome: "verified", slot, replaced: null, addedComponent: { name: `Fx Slot ${slot}: DeNoise`, slot } },
+    });
+    expect(host.calls).toEqual([call]);
+    expect(host.list).toEqual(expect.arrayContaining([...components, `Fx Slot ${slot}: DeNoise`]));
+  });
+
+  it("builds a chain in order without slot", async () => {
+    const host = trackHost({ components: ["Track", ""] });
+    for (const name of ["Highpass", "DeNoise", "Parametric Equalizer"]) await expect(addInsert({ track_index: 0, effect_name: name })).resolves.toMatchObject({ success: true });
+    expect(host.list).toEqual(["Track", "", "Fx Slot 1: Highpass", "Fx Slot 2: DeNoise", "Fx Slot 3: Parametric Equalizer"]);
+  });
+
+  it("adds into a requested free slot", async () => {
+    const host = trackHost({ components: ["Track", "", "Fx Slot 1: Highpass"] });
+    await expect(addInsert({ track_index: 0, effect_name: "DeNoise", slot: 4 })).resolves.toMatchObject({ success: true, data: { slot: 4, addedComponent: { name: "Fx Slot 4: DeNoise" } } });
+    expect(host.calls).toEqual(["add:DeNoise@3"]);
+  });
+
+  it.each([
+    ["an occupied slot without replace", { slot: 1 }, "already holds Fx Slot 1: Highpass"],
+    ["an occupied slot with replace false", { slot: 1, replace: false }, "pass replace: true"],
+    ["a replace with the same effect", { slot: 1, replace: true, effect_name: "Highpass" }, "same effect changes nothing"],
+  ] as const)("refuses %s before changing anything", async (_label, extra, message) => {
+    const host = trackHost({ components: ["Track", "", "Fx Slot 1: Highpass"], undo: [4, 4] });
+    await expect(addInsert({ track_index: 0, effect_name: "DeNoise", ...extra }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining(message), data: { mutationOutcome: "not_applied" } });
+    expect(host.calls).toEqual([]);
+    expect(host.list).toEqual(["Track", "", "Fx Slot 1: Highpass"]);
+  });
+
+  it("replaces the insert in an occupied slot with replace: true and verifies only that slot changed", async () => {
+    const host = trackHost({ components: ["Track", "", "Fx Slot 1: Highpass", "Fx Slot 2: DeNoise"] });
+    await expect(addInsert({ track_index: 0, effect_name: "Parametric Equalizer", slot: 1, replace: true })).resolves.toMatchObject({
+      success: true,
+      data: { outcome: "verified", slot: 1, replaced: "Fx Slot 1: Highpass", addedComponent: { index: 2, name: "Fx Slot 1: Parametric Equalizer" }, evidence: { added: ["Fx Slot 1: Parametric Equalizer"], removed: ["Fx Slot 1: Highpass"] } },
+    });
+    expect(host.calls).toEqual(["add:Parametric Equalizer@0"]);
+    expect(host.list).toEqual(["Track", "", "Fx Slot 1: Parametric Equalizer", "Fx Slot 2: DeNoise"]);
+  });
+
+  it("refuses a track with all five slots full before changing anything", async () => {
+    const host = trackHost({ components: [...FULL] });
+    await expect(addInsert({ track_index: 0, effect_name: "Highpass" }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining("insert slots of audio track 0 are full"), data: { mutationOutcome: "not_applied" } });
+    expect(host.calls).toEqual([]);
+  });
+
+  it("still replaces in a full track when a slot and replace are given", async () => {
+    const host = trackHost({ components: [...FULL] });
+    await expect(addInsert({ track_index: 0, effect_name: "Parametric Equalizer", slot: 5, replace: true }))
+      .resolves.toMatchObject({ success: true, data: { outcome: "verified", replaced: "Fx Slot 5: DeNoise" } });
+    expect(host.list.at(-1)).toBe("Fx Slot 5: Parametric Equalizer");
+  });
+
+  // The pre-fix live failure: a one-argument add replaced slot 1's Highpass with DeNoise.
+  it("does not verify an add that replaced another slot's insert", async () => {
+    trackHost({ components: ["Track", "", "Fx Slot 1: Highpass"], ignoreSlotIndex: true });
+    await expect(addInsert({ track_index: 0, effect_name: "DeNoise" })).resolves.toMatchObject({
+      success: false,
+      error: expect.stringContaining("wanted Fx Slot 2: DeNoise"),
+      data: { mutationOutcome: "committed_unverified", evidence: { added: ["Fx Slot 1: DeNoise"], removed: ["Fx Slot 1: Highpass"] } },
+    });
   });
 
   it.each([
@@ -2115,20 +2248,90 @@ describe("audio track inserts", () => {
     trackHost();
     await expect(addInsert({ track_index: 5, effect_name: "Highpass" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("out of range") });
     await expect(addInsert({ track_index: -1, effect_name: "Highpass" })).resolves.toMatchObject({ success: false, error: "track_index must be a non-negative integer" });
+    for (const slot of [0, 6, 1.5]) await expect(addInsert({ track_index: 0, effect_name: "Highpass", slot })).resolves.toMatchObject({ success: false, error: "slot must be an integer from 1 to 5" });
+    await expect(addInsert({ track_index: 0, effect_name: "Highpass", replace: "yes" as never })).resolves.toMatchObject({ success: false, error: "replace must be a boolean" });
     await expect(removeInsert({ track_index: 0, effect_name: "Highpass", index: 1.5 })).resolves.toMatchObject({ success: false, error: "index must be a non-negative integer" });
+    await expect(setBypass({ track_index: 0, bypassed: true })).resolves.toMatchObject({ success: false, error: "Give slot or effect_name to name the insert" });
+    await expect(setBypass({ track_index: 0, slot: 1, bypassed: "true" as never })).resolves.toMatchObject({ success: false, error: "bypassed must be a boolean" });
+    await expect(setBypass({ track_index: 0, slot: 9, bypassed: true })).resolves.toMatchObject({ success: false, error: "slot must be an integer from 1 to 5" });
   });
 
   it("escapes the effect name", async () => {
     const name = 'High"pass\\\n';
     const host = trackHost({ audioEffects: [name] });
     await expect(addInsert({ track_index: 0, effect_name: name })).resolves.toMatchObject({ success: true });
-    expect(host.list.at(-1)).toBe(name);
+    expect(host.list.at(-1)).toBe(`Fx Slot 1: ${name}`);
   });
 
   it("calls an unchanged readback unknown when the undo stack moved", async () => {
     trackHost({ addNoop: true, undo: [10, 11] });
     await expect(addInsert({ track_index: 0, effect_name: "Highpass" }))
       .resolves.toMatchObject({ success: false, data: { mutationOutcome: "unknown" } });
+  });
+
+  // Live Premiere 27.0: setParamValue("Bypass", "true", "0") returned true, read back "true", one undo entry (4 -> 5).
+  it.each([
+    ["slot", { slot: 2 }, true],
+    ["effect name", { effect_name: "DeNoise" }, true],
+    ["full component name and slot", { slot: 2, effect_name: "Fx Slot 2: DeNoise" }, true],
+    ["slot, re-enabling", { slot: 2 }, false],
+  ] as const)("sets Bypass by %s with string arguments and verifies the readback", async (_label, target, bypassed) => {
+    const host = trackHost({ components: ["Track", "", "Fx Slot 1: Highpass", "Fx Slot 2: DeNoise"], bypassed: { "Fx Slot 2: DeNoise": !bypassed }, undo: [4, 5] });
+    await expect(setBypass({ track_index: 0, ...target, bypassed })).resolves.toMatchObject({
+      success: true,
+      data: {
+        outcome: "verified", mutationOutcome: "verified", changed: true, bypassed, previouslyBypassed: !bypassed, slot: 2, effect: "DeNoise", component: "Fx Slot 2: DeNoise", params: ["Bypass", "Cutoff"],
+        evidence: { before: !bypassed, after: bypassed, hostReturn: "true", undoSteps: 1 },
+        undo: { tool: "undo", expected_undo_stack_index: 5, undo_to_stack_index: 4 },
+      },
+    });
+    expect(host.calls).toEqual([`set:"Bypass","${bypassed}","0"`]);
+    expect(host.bypass.get("Fx Slot 1: Highpass")).toBeUndefined();
+  });
+
+  it("reports an insert already in the requested state as verified without calling the host", async () => {
+    const host = trackHost({ components: ["Fx Slot 1: Highpass"], bypassed: { "Fx Slot 1: Highpass": true } });
+    await expect(setBypass({ track_index: 0, slot: 1, bypassed: true })).resolves.toMatchObject({ success: true, data: { outcome: "verified", changed: false } });
+    expect(host.calls).toEqual([]);
+  });
+
+  it.each([
+    ["an empty slot", { components: ["Track", "", "Fx Slot 1: Highpass"] }, { slot: 2 }, "no track insert at slot 2"],
+    ["a name in another slot", { components: ["Fx Slot 1: Highpass"] }, { slot: 1, effect_name: "DeNoise" }, "no track insert at slot 1 (DeNoise)"],
+    ["a non-insert component", { components: ["Track", "Volume"] }, { effect_name: "Volume" }, "no track insert at Volume"],
+    ["a name in two slots", { components: ["Fx Slot 1: Highpass", "Fx Slot 3: Highpass"] }, { effect_name: "Highpass" }, "in slots 1, 3; pass slot"],
+    ["an insert without Bypass", { components: ["Fx Slot 1: Highpass"], params: ["Cutoff"] }, { slot: 1 }, "has no Bypass parameter"],
+    ["an insert without getParamList()", { components: ["Fx Slot 1: Highpass"], params: "none" }, { slot: 1 }, "no readable getParamList()"],
+    // A host exception before any change becomes a determinate refusal, not an uncaught throw that locks recovery.
+    ["a throwing getParamList()", { components: ["Fx Slot 1: Highpass"], params: "throws" }, { slot: 1 }, "no readable getParamList()"],
+  ] as const)("refuses %s before changing anything", async (_label, options, target, message) => {
+    const host = trackHost({ ...options, components: [...options.components], params: Array.isArray(options.params) ? [...options.params] : options.params as TrackOptions["params"] });
+    await expect(setBypass({ track_index: 0, ...target, bypassed: true }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining(message), data: { mutationOutcome: "not_applied" } });
+    expect(host.calls).toEqual([]);
+  });
+
+  it("marks a missing Bypass as a capability error", async () => {
+    trackHost({ components: ["Fx Slot 1: Highpass"], params: ["Cutoff"] });
+    await expect(setBypass({ track_index: 0, slot: 1, bypassed: true }))
+      .resolves.toMatchObject({ success: false, error: expect.stringMatching(/^Capability error/), data: { capability: "track_insert_bypass_unavailable", params: ["Cutoff"] } });
+  });
+
+  it.each([
+    ["a thrown setParamValue", { setThrows: true }, "host refused"],
+    ["an ignored setParamValue", { setNoop: true }, "did not change Bypass"],
+  ] as const)("reports %s with an unchanged readback as not applied", async (_label, options, message) => {
+    trackHost({ components: ["Fx Slot 1: Highpass"], undo: [5, 5], ...options });
+    await expect(setBypass({ track_index: 0, slot: 1, bypassed: true })).resolves.toMatchObject({
+      success: false,
+      error: expect.stringContaining(message),
+      data: { mutationOutcome: "not_applied", timelineChanged: false, evidence: { before: false, after: false } },
+    });
+  });
+
+  it("calls an unchanged Bypass readback unknown when the undo stack moved", async () => {
+    trackHost({ components: ["Fx Slot 1: Highpass"], undo: [5, 6], setNoop: true });
+    await expect(setBypass({ track_index: 0, slot: 1, bypassed: true })).resolves.toMatchObject({ success: false, data: { mutationOutcome: "unknown" } });
   });
 
   it("removes the last matching insert and verifies", async () => {
@@ -2167,11 +2370,11 @@ describe("audio track inserts", () => {
     expect(host.calls).toEqual([]);
   });
 
-  it("reports an ignored removal as a capability error that changed nothing", async () => {
+  it("reports an ignored removal as a capability error that points to bypass", async () => {
     trackHost({ components: ["Track", "", "Fx Slot 1: Highpass"], removeNoop: true, undo: [5, 5] });
     await expect(removeInsert({ track_index: 0, effect_name: "Highpass" })).resolves.toMatchObject({
       success: false,
-      error: expect.stringMatching(/^Capability error: Premiere ignored QE remove\(\) on Fx Slot 1: Highpass.*Audio Track Mixer/),
+      error: expect.stringMatching(/^Capability error: Premiere ignored QE remove\(\) on Fx Slot 1: Highpass.*set_audio_track_effect_bypass \(slot 1\).*Audio Track Mixer/),
       data: { mutationOutcome: "not_applied", timelineChanged: false, capability: "track_insert_removal_unavailable" },
     });
   });

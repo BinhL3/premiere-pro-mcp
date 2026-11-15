@@ -1731,6 +1731,48 @@ function __trackInsertNameMatches(componentName, wanted) {
   return componentName === wanted || __trackInsertParts(componentName).effectName === wanted;
 }
 
+// The Audio Track Mixer has five insert slots per track; QE addresses them
+// 0-4, Premiere names them "Fx Slot 1".."Fx Slot 5".
+var __TRACK_INSERT_SLOTS = 5;
+
+// Slot number (1-based) -> component name for the slotted inserts in names.
+function __trackInsertSlots(names) {
+  var slots = {};
+  for (var i = 0; i < names.length; i++) {
+    var slot = __trackInsertParts(names[i]).slot;
+    if (slot !== null && slot >= 1 && slot <= __TRACK_INSERT_SLOTS && slots[slot] === undefined) slots[slot] = names[i];
+  }
+  return slots;
+}
+
+// "true"/"false" from a QE param string, or null for anything else.
+function __qeBooleanParam(value) {
+  var text = String(value).toLowerCase();
+  if (text === "true") return true;
+  return text === "false" ? false : null;
+}
+
+// A track insert's QE params (getParamList() is "Bypass,Cutoff" on Premiere
+// 27.0) and its Bypass state; null where QE cannot say. Never throws.
+function __trackInsertParams(component) {
+  var out = { params: null, bypassed: null };
+  try {
+    if (!component || typeof component.getParamList !== "function") return out;
+    var raw = component.getParamList();
+    var list = raw instanceof Array ? raw : String(raw).split(",");
+    out.params = [];
+    for (var i = 0; i < list.length; i++) {
+      var name = String(list[i]).replace(/^\\s+|\\s+$/g, "");
+      if (name !== "") out.params.push(name);
+    }
+  } catch (eParams) { out.params = null; return out; }
+  var hasBypass = false;
+  for (var p = 0; p < out.params.length; p++) if (out.params[p] === "Bypass") hasBypass = true;
+  if (!hasBypass || typeof component.getParamValue !== "function") return out;
+  try { out.bypassed = __qeBooleanParam(component.getParamValue("Bypass")); } catch (eBypass) { out.bypassed = null; }
+  return out;
+}
+
 // How to reverse a track-insert command with the undo tool. One QE track
 // insert recorded two undo-stack entries on Premiere 27.0 and a single undo
 // reversed both, so the hint names the stack index to land on, not a count.
