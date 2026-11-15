@@ -230,7 +230,8 @@ describe("QE clip lookup by DOM clip start (#642)", () => {
       if (tool === trackTargeting.get_qe_clip_info) continue;
       const result = await run(host, tool, args);
       expect(result.success).toBe(false);
-      expect(result.error).toMatch(/Could not match the QE clip for .*by timeline start; nothing was changed\./);
+      // This host has only video clips, which apply_audio_effect refuses first.
+      expect(result.error).toMatch(tool === effects.apply_audio_effect ? /is a video clip/ : /Could not match the QE clip for .*by timeline start; nothing was changed\./);
     }
     for (const item of [host.gap, host.qeA, host.qeB]) {
       for (const fn of ["setName", "removeEffects", "setFrameBlend", "setTimeInterpolationType", "addVideoEffect", "addAudioEffect"] as const) {

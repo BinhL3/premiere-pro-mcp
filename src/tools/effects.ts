@@ -84,7 +84,7 @@ function applyEffectWithReadback(kind: "Video" | "Audio"): string {
 export function getEffectsTools(bridgeOptions: BridgeOptions) {
   return {
     apply_effect: {
-      description: "Apply a video effect to a clip. Experimental QE DOM catalog lookup includes an exact-name probe when enumeration is empty. A component-list readback does not verify rendered pixels.",
+      description: "Apply a video effect to a video clip (audio clips are refused; use apply_audio_effect). Experimental QE DOM catalog lookup includes an exact-name probe when enumeration is empty. A component-list readback does not verify rendered pixels.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -108,12 +108,10 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           var result = __findClip("${escapeForExtendScript(args.node_id)}");
           if (!result) return __refuse("Clip not found: ${escapeForExtendScript(args.node_id)}");
           
-          // Find the effect in QE
           var effectName = "${escapeForExtendScript(args.effect_name)}";
-          var qeTrack = result.trackType === "video" 
-            ? qeSeq.getVideoTrackAt(result.trackIndex)
-            : qeSeq.getAudioTrackAt(result.trackIndex);
-          
+          // Names such as DeNoise exist as both kinds; never put a video effect on an audio clip.
+          if (result.trackType !== "video") return __refuse("apply_effect adds video effects, and " + result.clip.name + " is an audio clip. Use apply_audio_effect; nothing was changed.");
+          var qeTrack = qeSeq.getVideoTrackAt(result.trackIndex);
           if (!qeTrack) return __refuse("QE track not found");
 
           // QE track items include gaps, so the DOM clip index is not a QE index.
@@ -145,7 +143,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
     },
 
     apply_audio_effect: {
-      description: "Apply an audio effect to a clip. Experimental QE catalog lookup includes an exact-name probe when enumeration is empty. A component-list readback does not verify rendered audio.",
+      description: "Apply an audio effect to one audio clip (video clips are refused). It is a clip effect, not an Audio Track Mixer track insert, which Premiere's scripting APIs do not expose. Experimental QE catalog lookup includes an exact-name probe when enumeration is empty. A component-list readback does not verify rendered audio.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -170,6 +168,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           if (!result) return __refuse("Clip not found");
           
           var effectName = "${escapeForExtendScript(args.effect_name)}";
+          if (result.trackType !== "audio") return __refuse("apply_audio_effect adds audio effects, and " + result.clip.name + " is a video clip. Use apply_effect; nothing was changed.");
           var qeTrack = qeSeq.getAudioTrackAt(result.trackIndex);
           if (!qeTrack) return __refuse("QE audio track not found");
 

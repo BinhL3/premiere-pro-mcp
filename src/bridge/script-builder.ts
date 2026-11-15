@@ -1435,6 +1435,21 @@ function __qeEffectObject(kind, entry) {
   }
 }
 
+// Resolve an effect of one kind only. Names such as DeNoise, Highpass and
+// Parametric Equalizer exist as both a video and an audio effect, so a caller
+// must look up the kind of the clip it is changing, never "video, else audio".
+function __qeEffectByName(kind, name) {
+  var effect = null;
+  try { effect = kind === "audio" ? qe.project.getAudioEffectByName(name) : qe.project.getVideoEffectByName(name); } catch (eByName) {}
+  if (effect) return effect;
+  var catalog = __getQeEffectCatalog(kind);
+  if (!catalog.ok) return null;
+  for (var i = 0; i < catalog.effects.numItems; i++) {
+    if (catalog.effects[i].name === name) return __qeEffectObject(kind, catalog.effects[i]);
+  }
+  return null;
+}
+
 function __qeTransitionObject(kind, entry) {
   if (!entry) return null;
   if (!entry.__qeStub) return entry;

@@ -35,7 +35,7 @@ describe.each(["apply_effect", "apply_audio_effect"] as const)("%s readback", (t
         getVideoEffectByName: lookup, getAudioEffectByName: lookup,
         getVideoEffectList: () => [], getAudioEffectList: () => [],
       } },
-      findClip: (id: string) => id === "missing" ? null : ({ clip, trackType: "video", trackIndex: 0 }),
+      findClip: (id: string) => id === "missing" ? null : ({ clip, trackType: tool === "apply_audio_effect" ? "audio" : "video", trackIndex: 0 }),
       findQeClip: () => { if (mode === "tracked-noop") { context.__undoStart = 3; } return qeClip; },
       __undoStart: null as number | null,
       readUndo: () => mode === "tracked-noop" ? 3 : null,

@@ -1839,3 +1839,86 @@ describe("source evidence preserves lookup failures", () => {
     expect(mockedSendCommand).toHaveBeenCalledTimes(1);
   });
 });
+
+// Premiere 27: DeNoise, Highpass and Parametric Equalizer exist as both video
+// and audio effects, so batch_apply_effect must resolve the clip's own kind.
+describe("batch_apply_effect resolves the effect kind per clip", () => {
+  const clipboard = getClipboardTools(bridgeOptions);
+
+  function batchHost(options: { video: string[]; audio: string[]; selected?: boolean; audioAddNoop?: boolean }) {
+    const applied: Array<{ clip: string; kind: string }> = [];
+    function makeClip(name: string, kind: "video" | "audio") {
+      const list: Array<{ displayName: string; matchName: string }> = kind === "audio"
+        ? [{ displayName: "Volume", matchName: "Internal Volume Stereo" }]
+        : [{ displayName: "Motion", matchName: "AE.ADBE Motion" }];
+      const components = new Proxy({}, { get: (_t, key) => (key === "numItems" ? list.length : list[Number(key)]) });
+      const clip = { nodeId: name, name, start: { ticks: "0" }, end: { ticks: "254016000000" }, components, isSelected: () => options.selected !== false };
+      const add = (effect: { kind: string; name: string }) => {
+        applied.push({ clip: name, kind: effect.kind });
+        if (effect.kind !== kind) throw new Error("wrong effect kind for this clip");
+        if (kind === "audio" && options.audioAddNoop) return;
+        list.push({ displayName: effect.name, matchName: effect.name });
+      };
+      const qeClip = { type: "Clip", start: { ticks: "0" }, addVideoEffect: add, addAudioEffect: add };
+      return { clip, qeTrack: { numItems: 1, getItemAt: () => qeClip } };
+    }
+    const v = makeClip("Picture", "video");
+    const a = makeClip("Dialogue", "audio");
+    const seq = { sequenceID: "s", videoTracks: { numTracks: 1, 0: { clips: { numItems: 1, 0: v.clip } } }, audioTracks: { numTracks: 1, 0: { clips: { numItems: 1, 0: a.clip } } } };
+    mockedSendCommand.mockImplementation(async (script: string) => {
+      const source = `${getHelpersSource()}\n${script}`;
+      parse(source, { ecmaVersion: 3, allowReserved: "never" });
+      return JSON.parse(String(runInNewContext(source, {
+        app: { enableQE: () => {}, project: { activeSequence: seq } },
+        qe: { project: {
+          getActiveSequence: () => ({ getVideoTrackAt: () => v.qeTrack, getAudioTrackAt: () => a.qeTrack }),
+          getVideoEffectByName: (name: string) => (options.video.includes(name) ? { kind: "video", name } : null),
+          getAudioEffectByName: (name: string) => (options.audio.includes(name) ? { kind: "audio", name } : null),
+        } },
+      })));
+    });
+    return applied;
+  }
+
+  it.each(["DeNoise", "Highpass", "Parametric Equalizer"])("applies the audio %s to an audio track even when a video effect has that name", async (name) => {
+    const applied = batchHost({ video: [name], audio: [name] });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: name, target: "track", track_type: "audio", track_index: 0 }))
+      .resolves.toMatchObject({ success: true, data: { applied: 1, effectType: "audio", scope: "per_clip" } });
+    expect(applied).toEqual([{ clip: "Dialogue", kind: "audio" }]);
+  });
+
+  it.each(["selected", "all"] as const)("gives each clip its own kind of a shared name for %s", async (target) => {
+    const applied = batchHost({ video: ["DeNoise"], audio: ["DeNoise"] });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "DeNoise", target }))
+      .resolves.toMatchObject({ success: true, data: { applied: 2, appliedByKind: { video: 1, audio: 1 }, selectedIncompatible: 0 } });
+    expect(applied).toEqual([{ clip: "Picture", kind: "video" }, { clip: "Dialogue", kind: "audio" }]);
+  });
+
+  it("skips clips whose kind has no effect of that name", async () => {
+    const applied = batchHost({ video: [], audio: ["Hard Limiter"] });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "Hard Limiter", target: "selected" }))
+      .resolves.toMatchObject({ success: true, data: { applied: 1, effectType: "audio", selectedIncompatible: 1 } });
+    expect(applied).toEqual([{ clip: "Dialogue", kind: "audio" }]);
+  });
+
+  it("refuses a video-only effect on an audio track before changing anything", async () => {
+    const applied = batchHost({ video: ["Gaussian Blur"], audio: [] });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "Gaussian Blur", target: "track", track_type: "audio", track_index: 0 }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining("only a video effect") });
+    expect(applied).toEqual([]);
+  });
+
+  it("keeps apply_effect and apply_audio_effect on their own clip kind", async () => {
+    const effects = getEffectsTools(bridgeOptions);
+    const applied = batchHost({ video: ["DeNoise"], audio: ["DeNoise"] });
+    await expect(effects.apply_effect.handler({ node_id: "Dialogue", effect_name: "DeNoise" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("Use apply_audio_effect") });
+    await expect(effects.apply_audio_effect.handler({ node_id: "Picture", effect_name: "DeNoise" })).resolves.toMatchObject({ success: false, error: expect.stringContaining("Use apply_effect") });
+    expect(applied).toEqual([]);
+  });
+
+  it("reports a partly applied batch as committed, not unknown", async () => {
+    batchHost({ video: ["DeNoise"], audio: ["DeNoise"], audioAddNoop: true });
+    await expect(clipboard.batch_apply_effect.handler({ effect_name: "DeNoise", target: "all" }))
+      .resolves.toMatchObject({ success: false, data: { mutationOutcome: "committed_unverified", timelineChanged: true, applied: 1 } });
+  });
+});
