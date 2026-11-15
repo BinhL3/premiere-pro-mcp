@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `batch_apply_effect` resolves the effect for each clip's own kind. DeNoise, Highpass and Parametric Equalizer also match a video effect, so `target: "track"` on an audio track used to pick the video effect and refuse; `selected` and `all` now give audio clips the audio effect and video clips the video effect of a shared name. `apply_effect` and `apply_audio_effect` refuse a clip of the other kind instead of adding a mismatched effect. `target: "track"` is documented as per clip: Premiere's scripting APIs expose no Audio Track Mixer track-effect slot.
+- Effect removal (`remove_effect`, `remove_effect_by_name`, `remove_all_effects`) reports a determinate outcome after a removal attempt. A removal Premiere ignored or refused is `not_applied` when the undo stack or a QE component readback confirms nothing changed, and a readback that shows any change is `committed_unverified`. These used to omit an outcome, so the receipt was unknown and set a recovery lock (`HOST_RECOVERY_REQUIRED`) that blocked every later edit. Only a clip that vanished, or an unchanged readback nothing can confirm, stays unknown, and the error names the missing evidence.
+- `batch_apply_effect` failures carry `committed_unverified` when any clip took the effect and `not_applied` when the undo stack shows no change, instead of an unknown outcome.
+
 ## [1.31.0] - 2026-11-11
 
 ### Fixed

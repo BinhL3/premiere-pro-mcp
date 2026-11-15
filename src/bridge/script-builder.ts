@@ -1562,15 +1562,17 @@ function __componentClassificationProblem(clip, trackType) {
 // before anything is removed, so a component neither path can remove refuses
 // the whole call with nothing changed.
 // Returns { removed, failures, before, remaining, verified, nothingRemoved,
-// unsupported } where unsupported explains a refusal made before any removal.
+// unsupported, receipt, uncertainty } where unsupported explains a refusal made
+// before any removal and receipt carries the mutation outcome for __error.
 function __removeClipComponents(result, wanted) {
   var clip = result.clip;
-  var out = { removed: [], failures: [], before: [], remaining: [], verified: false, nothingRemoved: true, unsupported: null, mutationAttempted: false };
+  var out = { removed: [], failures: [], before: [], remaining: [], verified: false, nothingRemoved: true, unsupported: null, mutationAttempted: false, threw: false };
   var targets = [];
   out.unsupported = __componentClassificationProblem(clip, result.trackType);
   if (out.unsupported) {
     for (var u = 0; u < clip.components.numItems; u++) out.remaining.push(String(clip.components[u].displayName));
     out.before = out.remaining.slice();
+    out.receipt = { mutationOutcome: "not_applied", timelineChanged: false };
     return out;
   }
   for (var b = 0; b < clip.components.numItems; b++) out.before.push(String(clip.components[b].displayName));
@@ -1588,6 +1590,7 @@ function __removeClipComponents(result, wanted) {
       qeClip = __findQeClipByDomClip(qeTrack, clip);
     } catch (eQe) {}
   }
+  var qeBefore = __qeComponentNames(qeClip);
   // Preflight: pick a removal path for every target before changing anything.
   for (var p = 0; p < targets.length; p++) {
     var candidate = targets[p];
@@ -1603,6 +1606,7 @@ function __removeClipComponents(result, wanted) {
   }
   if (out.failures.length) {
     out.remaining = out.before.slice();
+    out.receipt = { mutationOutcome: "not_applied", timelineChanged: false };
     return out;
   }
   var expected = out.before.slice();
@@ -1615,14 +1619,80 @@ function __removeClipComponents(result, wanted) {
         var qeComponent = qeClip.getComponentAt(target.index);
         if (qeComponent && String(qeComponent.name) === target.name) { out.mutationAttempted = true; qeComponent.remove(); done = true; }
       }
-    } catch (eRemove) {}
+    } catch (eRemove) { out.threw = true; }
     if (done) { out.removed.push(target.name); out.nothingRemoved = false; expected.splice(target.index, 1); }
     else out.failures.push(target.name);
   }
   var again = __findClip(String(clip.nodeId));
   if (again) for (var r = 0; r < again.clip.components.numItems; r++) out.remaining.push(String(again.clip.components[r].displayName));
   out.verified = !!again && out.remaining.join("|") === expected.join("|");
+  var qeAfter = null;
+  if (qeBefore) {
+    try {
+      app.enableQE();
+      var qeSeqAfter = qe.project.getActiveSequence();
+      qeAfter = __qeComponentNames(__findQeClipByDomClip(result.trackType === "video" ? qeSeqAfter.getVideoTrackAt(result.trackIndex) : qeSeqAfter.getAudioTrackAt(result.trackIndex), again ? again.clip : clip));
+    } catch (eQeAfter) { qeAfter = null; }
+  }
+  __classifyRemovalOutcome(out, !!again, qeBefore, qeAfter);
   return out;
+}
+
+// Component names as QE sees them, or null when QE cannot list them.
+function __qeComponentNames(qeClip) {
+  if (!qeClip || typeof qeClip.getComponentAt !== "function") return null;
+  var count = NaN;
+  try { count = Number(qeClip.numComponents); } catch (eCount) {}
+  if (isNaN(count) || count < 0 || Math.floor(count) !== count) return null;
+  var names = [];
+  for (var i = 0; i < count; i++) {
+    var component = null;
+    try { component = qeClip.getComponentAt(i); } catch (eAt) { return null; }
+    if (!component) return null;
+    names.push(String(component.name));
+  }
+  return names;
+}
+
+// Every removal ends with a determinate receipt where the evidence allows:
+// "unknown" puts the whole host into recovery, so it is reserved for a clip
+// that vanished, or a component list that reads back unchanged while neither
+// the undo stack nor QE can confirm nothing happened.
+function __classifyRemovalOutcome(out, clipFound, qeBefore, qeAfter) {
+  out.evidence = { domBefore: out.before, domAfter: out.remaining, qeBefore: qeBefore, qeAfter: qeAfter, undoSteps: null };
+  if (!out.mutationAttempted) { out.receipt = { mutationOutcome: "not_applied", timelineChanged: false }; return; }
+  var undoNow = __undoStart !== null ? __readUndoIndex() : null;
+  var undoKnown = __undoStart !== null && undoNow !== null;
+  if (undoKnown) out.evidence.undoSteps = undoNow - __undoStart;
+  if (!clipFound) {
+    out.uncertainty = "The clip could not be found again after the removal, so its components could not be read back.";
+    out.receipt = { mutationOutcome: "unknown", timelineChanged: null, evidence: out.evidence };
+    return;
+  }
+  if (out.verified && out.removed.length) {
+    out.receipt = { mutationOutcome: out.failures.length ? "committed_unverified" : "verified", timelineChanged: true, evidence: out.evidence };
+    return;
+  }
+  var domUnchanged = out.remaining.join("|") === out.before.join("|");
+  if (!domUnchanged && out.threw) {
+    out.uncertainty = "Premiere threw during the removal and the clip's components changed to " + out.remaining.join(", ") + ", so the host may be mid-operation.";
+    out.receipt = { mutationOutcome: "unknown", timelineChanged: true, evidence: out.evidence };
+    return;
+  }
+  if (!domUnchanged) {
+    out.receipt = { mutationOutcome: "committed_unverified", timelineChanged: true, evidence: out.evidence };
+    return;
+  }
+  var qeUnchanged = !!qeBefore && !!qeAfter && qeBefore.join("|") === qeAfter.join("|");
+  var undoUnchanged = undoKnown && undoNow === __undoStart;
+  if (undoUnchanged || (!undoKnown && qeUnchanged)) {
+    out.receipt = { mutationOutcome: "not_applied", timelineChanged: false, evidence: out.evidence };
+    return;
+  }
+  out.uncertainty = undoKnown
+    ? "The clip's components read back unchanged, but Premiere recorded " + (undoNow - __undoStart) + " undo step(s), so something else may have changed."
+    : "The clip's components read back unchanged, but neither the undo stack nor QE could confirm that nothing changed.";
+  out.receipt = { mutationOutcome: "unknown", timelineChanged: null, evidence: out.evidence };
 }
 
 function __getQeEffectCatalog(kind) {

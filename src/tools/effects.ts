@@ -198,7 +198,7 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
     },
 
     remove_effect: {
-      description: "Remove one effect from a clip by its index or name (the last instance when names repeat) and verify the clip's components afterwards. Built-in components (Opacity, Motion, Volume, Channel Volume, Panner) cannot be removed. EXPERIMENTAL: when Premiere has no Component.remove() (25.2), it removes through the undocumented QE DOM's targeted qeClip.getComponentAt(i).remove(). Every matching component's removal path is checked before any is removed; it returns a capability error, with nothing changed, when neither path is available.",
+      description: "Remove one effect from a clip by its index or name (the last instance when names repeat) and verify the clip's components afterwards. Built-in components (Opacity, Motion, Time Remapping, Volume, Channel Volume, Panner) cannot be removed; applied audio effects whose match name starts with \"Internal\" (such as Internal Highpass) can. EXPERIMENTAL: when Premiere has no Component.remove() (25.2), it removes through the undocumented QE DOM's targeted qeClip.getComponentAt(i).remove(). Every matching component's removal path is checked before any is removed; it returns a capability error, with nothing changed, when neither path is available.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -240,13 +240,12 @@ export function getEffectsTools(bridgeOptions: BridgeOptions) {
           `}
           if (__isBuiltInComponentForClip(clip.components[chosen], result.trackType)) return __error(effectName + " is a built-in clip component, not an effect, and cannot be removed.", { mutationOutcome: "not_applied", timelineChanged: false });
           var removal = __removeClipComponents(result, function (name, index) { return index === chosen; });
-          var failureReceipt = removal.mutationAttempted === false
-            ? { mutationOutcome: "not_applied", timelineChanged: false }
-            : { mutationOutcome: "unknown", timelineChanged: null };
+          var failureReceipt = removal.receipt;
+          var uncertainty = removal.uncertainty ? " " + removal.uncertainty : "";
           if (removal.unsupported) return __error("Capability error: " + removal.unsupported + " Nothing was removed; remove effects in Effect Controls.", failureReceipt);
-          if (removal.failures.length && removal.nothingRemoved) return __error(removal.mutationAttempted === false ? "Capability error: Premiere exposes neither Component.remove() nor a matching QE component for " + effectName + ". The effect was not removed; remove it in Effect Controls." : "A removal was attempted, but Premiere did not confirm completion. Inspect the component stack before any retry.", failureReceipt);
-          if (removal.failures.length) return __error("Premiere could not remove " + effectName + " from this clip; it is still present. Inspect Effect Controls.");
-          if (!removal.verified) return __error((removal.remaining.join("|") === removal.before.join("|") ? "Premiere's removal did not take effect: the clip still has " : "Premiere's removal did not take effect as expected: the clip's components read back as ") + removal.remaining.join(", ") + ". Inspect Effect Controls.");
+          if (removal.failures.length && removal.nothingRemoved) return __error(removal.mutationAttempted === false ? "Capability error: Premiere exposes neither Component.remove() nor a matching QE component for " + effectName + ". The effect was not removed; remove it in Effect Controls." : (failureReceipt.mutationOutcome === "not_applied" ? "Premiere refused the removal; the clip's components are unchanged." : "A removal was attempted, but Premiere did not confirm completion." + uncertainty + " Inspect the component stack before any retry."), failureReceipt);
+          if (!removal.verified) return __error((removal.remaining.join("|") === removal.before.join("|") ? "Premiere's removal did not take effect: the clip still has " : "Premiere's removal did not take effect as expected: the clip's components read back as ") + removal.remaining.join(", ") + "." + uncertainty + " Inspect Effect Controls.", failureReceipt);
+          if (removal.failures.length) return __error("Premiere could not remove " + effectName + " from this clip; it is still present. Inspect Effect Controls.", failureReceipt);
           return __result({ removed: true, verified: true, effect: effectName, remaining: removal.remaining });
         `);
         return sendCommand(script, bridgeOptions);

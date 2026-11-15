@@ -622,16 +622,21 @@ describe("issue #129 — effect removal uses the targeted QE component remove an
   const clipboard = getClipboardTools(bridgeOptions);
   const advanced = getAdvancedTools(bridgeOptions);
 
-  function removalHost(names: string[], options: { qeRemoveNoop?: boolean; noQeFor?: string[]; noQeAt?: number[]; matchNames?: Record<string, string>; trackType?: "video" | "audio" } = {}) {
+  function removalHost(names: string[], options: { qeRemoveNoop?: boolean; qeRemoveThrows?: boolean; qeCount?: boolean; noQeFor?: string[]; noQeAt?: number[]; matchNames?: Record<string, string>; trackType?: "video" | "audio" } = {}) {
     const list = names.map((displayName) => ({ displayName, matchName: options.matchNames?.[displayName] ?? displayName }));
     const components = new Proxy({}, { get: (_t, key) => (key === "numItems" ? list.length : list[Number(key)]) });
     const clip = { nodeId: "clip1", name: "Speaker", start: { ticks: "0" }, end: { ticks: "254016000000" }, components };
     const qeClip = {
       type: "Clip",
       start: { ticks: "0" },
+      ...(options.qeCount ? { get numComponents() { return list.length; } } : {}),
       getComponentAt: (index: number) => (options.noQeFor?.includes(list[index]?.displayName) || options.noQeAt?.includes(index) ? null : {
         name: list[index]?.displayName,
-        remove: () => { if (!options.qeRemoveNoop) list.splice(index, 1); return true; },
+        remove: () => {
+          if (options.qeRemoveThrows) throw new Error("Premiere refused");
+          if (!options.qeRemoveNoop) list.splice(index, 1);
+          return true;
+        },
       }),
       removeEffects: () => { throw new Error("broad removeEffects must not be used"); },
     };
@@ -661,7 +666,7 @@ describe("issue #129 — effect removal uses the targeted QE component remove an
   const intrinsicNames = ["Volume", "Channel Volume", "Panner", "Motion", "Opacity"];
   const intrinsicMatches = { Volume: "Internal Volume Stereo", "Channel Volume": "Internal Channel Volume Stereo", Panner: "Internal Audio Panner", Motion: "AE.ADBE Motion", Opacity: "AE.ADBE Opacity" };
   for (const mode of removalModes) {
-    it.each([["Highpass", "Internal Highpass"], ["Simple Parametric EQ", "Internal Parameteric EQ"], ['Highpass "quoted" \\ newline\n', "Internal Highpass"]])("removes applied Internal audio effect %s using " + mode, async (name, match) => {
+    it.each([["Highpass", "Internal Highpass"], ["Internal Highpass", "Internal Highpass"], ["Simple Parametric EQ", "Internal Parameteric EQ"], ['Highpass "quoted" \\ newline\n', "Internal Highpass"]])("removes applied Internal audio effect %s using " + mode, async (name, match) => {
       const list = removalHost([...intrinsicNames, name], { trackType: "audio", matchNames: { ...intrinsicMatches, [name]: match } });
       await expect(removeMode(mode, name)).resolves.toMatchObject({ success: true, data: { verified: true } });
       expect(names(list)).toEqual(intrinsicNames);
@@ -676,6 +681,29 @@ describe("issue #129 — effect removal uses the targeted QE component remove an
     it.each(intrinsicNames)("keeps true intrinsic %s on audio using " + mode, async name => {
       const list = removalHost(intrinsicNames, { trackType: "audio", matchNames: intrinsicMatches });
       await expect(removeMode(mode, name, intrinsicNames.indexOf(name))).resolves.toMatchObject({ success: false, error: expect.stringContaining("built-in") });
+      expect(names(list)).toEqual(intrinsicNames);
+    });
+  }
+
+  // Premiere 27: a DeNoise removal that changed nothing must not be reported
+  // as an unknown outcome, which puts the whole host into recovery.
+  for (const mode of removalModes) {
+    it("reports an ignored audio removal as not applied when QE confirms nothing changed using " + mode, async () => {
+      const list = removalHost([...intrinsicNames, "DeNoise"], { trackType: "audio", matchNames: { ...intrinsicMatches, DeNoise: "{8C8E9C70-guid}" }, qeRemoveNoop: true, qeCount: true });
+      await expect(removeMode(mode, "DeNoise")).resolves.toMatchObject({ success: false, data: { mutationOutcome: "not_applied", timelineChanged: false } });
+      expect(names(list)).toEqual([...intrinsicNames, "DeNoise"]);
+    });
+    it("reports a thrown audio removal as not applied when QE confirms nothing changed using " + mode, async () => {
+      removalHost([...intrinsicNames, "DeNoise"], { trackType: "audio", matchNames: { ...intrinsicMatches, DeNoise: "{8C8E9C70-guid}" }, qeRemoveThrows: true, qeCount: true });
+      await expect(removeMode(mode, "DeNoise")).resolves.toMatchObject({ success: false, error: expect.stringContaining("refused the removal"), data: { mutationOutcome: "not_applied" } });
+    });
+    it("names the missing evidence when an unchanged readback cannot be confirmed using " + mode, async () => {
+      removalHost([...intrinsicNames, "DeNoise"], { trackType: "audio", matchNames: { ...intrinsicMatches, DeNoise: "{8C8E9C70-guid}" }, qeRemoveNoop: true });
+      await expect(removeMode(mode, "DeNoise")).resolves.toMatchObject({ success: false, error: expect.stringContaining("neither the undo stack nor QE could confirm"), data: { mutationOutcome: "unknown" } });
+    });
+    it("verifies an audio effect removal with QE evidence using " + mode, async () => {
+      const list = removalHost([...intrinsicNames, "DeNoise"], { trackType: "audio", matchNames: { ...intrinsicMatches, DeNoise: "{8C8E9C70-guid}" }, qeCount: true });
+      await expect(removeMode(mode, "DeNoise")).resolves.toMatchObject({ success: true, data: { verified: true } });
       expect(names(list)).toEqual(intrinsicNames);
     });
   }
