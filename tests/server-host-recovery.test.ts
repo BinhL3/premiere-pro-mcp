@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Full catalog setup can contend with other processes on a loaded machine.
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
+// Each real bridge command re-verifies the private directory ACL by starting
+// powershell.exe (about 0.5 s idle, several seconds under load), so a single
+// write can take well over 2 s before the fixture observes it.
+const BRIDGE_WAIT = { timeout: 20_000 };
 import { existsSync, readdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
@@ -67,8 +71,19 @@ async function connected() {
       replied.add(commandName);
       if (script.includes("fixture-host-mutation")) accepted.push(commandName);
       // What __refuse returns when a lookup fails before any write.
+      // If this refusal comes after a mutation (write_then_refused), __refuse would detect
+      // that the undo history moved and NOT set refusedBeforeChange.
       if (script.includes("fixture-host-refusal")) {
-        writeFileSync(join(tempDir, commandName.replace(/^cmd_/, "res_").replace(/\.jsx$/, ".json")), JSON.stringify({ success: false, error: "Clip not found: stale", data: { mutationOutcome: "not_applied", timelineChanged: false, refusedBeforeChange: true } }), { mode: 0o600 });
+        const isAfterMutation = accepted.length > 0;
+        writeFileSync(join(tempDir, commandName.replace(/^cmd_/, "res_").replace(/\.jsx$/, ".json")), JSON.stringify({ 
+          success: false, 
+          error: "Clip not found: stale", 
+          data: { 
+            mutationOutcome: isAfterMutation ? undefined : "not_applied", 
+            timelineChanged: isAfterMutation ? null : false, 
+            ...(isAfterMutation ? {} : { refusedBeforeChange: true })
+          } 
+        }), { mode: 0o600 });
         continue;
       }
       const snapshot = script.includes("snapshot.clips.push")
@@ -81,7 +96,10 @@ async function connected() {
   // The production panel polls commands. Keep that fallback here as directory
   // watch notifications are hints rather than a reliable execution queue.
   const panelPoll = setInterval(respondToPublishedCommands, 25);
-  const server = createServer({ tempDir, timeoutMs: 500 }, {
+  // The simulated panel shares this process's event loop with the synchronous
+  // ACL checks, so a 500 ms response window can expire before it gets a turn on
+  // a loaded machine and turn an accepted fixture write into "not_applied".
+  const server = createServer({ tempDir, timeoutMs: 10_000 }, {
     toolPacks: "full", telemetry: { enabled: false, capture() {}, async shutdown() {} },
   });
   const client = new Client({ name: "server-workflow-recovery-test", version: "1.0.0" });
@@ -139,15 +157,15 @@ describe("server persists uncertain multi-command host workflows under their lea
     const abort = new AbortController();
     const cancelled = client.callTool({ name: "set_host_recovery_fixture", arguments: { mode: "cancel" } }, { signal: abort.signal });
     const observedCancellation = cancelled.then(() => "returned", () => "cancelled");
-    await vi.waitFor(() => expect(firstWriteAccepted).toBe(true), { timeout: 2000 });
+    await vi.waitFor(() => expect(firstWriteAccepted).toBe(true), BRIDGE_WAIT);
     const queued = client.callTool({ name: "set_host_recovery_fixture", arguments: { mode: "verified" } });
     abort.abort();
     expect(await observedCancellation).toBe("cancelled");
-    await vi.waitFor(() => expect(cancellationHandled).toBe(true), { timeout: 2000 });
+    await vi.waitFor(() => expect(cancellationHandled).toBe(true), BRIDGE_WAIT);
     expect(await queued).toMatchObject({ isError: true, structuredContent: { error: expect.stringContaining("HOST_RECOVERY_REQUIRED") } });
     expect(accepted).toHaveLength(1);
     expect(inspectHostRecovery(tempDir).recoveryRequired).toBe(true);
-    await vi.waitFor(() => expect(existsSync(join(tempDir, ".host-owner-lease"))).toBe(false), { timeout: 2000 });
+    await vi.waitFor(() => expect(existsSync(join(tempDir, ".host-owner-lease"))).toBe(false), BRIDGE_WAIT);
     await reviewedAcknowledge(client);
     const resumed = await client.callTool({ name: "set_host_recovery_fixture", arguments: { mode: "verified" } });
     expect(resumed.structuredContent?.error).toBeUndefined();
