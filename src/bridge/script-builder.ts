@@ -2512,6 +2512,19 @@ function __clipKeyframeBase(clip) {
   return { ok: true, inTicks: inTicks, durationSeconds: durationSeconds };
 }
 
+// Decimal digits of a non-negative tick count. ExtendScript prints numbers of
+// 1e15 or more (about 65 minutes of ticks) in exponent form, which never equals
+// Premiere's decimal Time.ticks, so print in 8-digit groups below that limit.
+function __tickDigits(ticks) {
+  var n = Math.round(Number(ticks));
+  if (!isFinite(n) || n < 0) return null;
+  if (n < 100000000) return String(n);
+  var high = Math.floor(n / 100000000);
+  var low = String(n - high * 100000000);
+  while (low.length < 8) low = "0" + low;
+  return __tickDigits(high) + low;
+}
+
 // Marker setters accept seconds on some hosts; Time getters may be detached.
 function __markerStoredTicks(marker, field) {
   try {
@@ -2521,9 +2534,8 @@ function __markerStoredTicks(marker, field) {
   } catch (readMarkerTimeError) { return null; }
 }
 function __setMarkerTick(marker, field, ticks) {
-  var numeric = Number(ticks);
-  if (!isFinite(numeric) || numeric < 0) return false;
-  var wanted = Math.round(numeric).toFixed(0);
+  var wanted = __tickDigits(ticks);
+  if (wanted === null) return false;
   if (__markerStoredTicks(marker, field) === wanted) return true;
   try { marker[field].ticks = wanted; } catch (markerTickWriteError) {}
   if (__markerStoredTicks(marker, field) === wanted) return true;

@@ -63,8 +63,10 @@ describe("marker integer tick storage", () => {
   });
   it("refuses unverified ignored time writes and reports the created marker", async () => {
     const h = host({ ignored: true });
-    expect(await getMarkerTools(options).add_marker.handler({ time_seconds: .5005 })).toMatchObject({ success: false, data: { outcome: 'committed_unverified', timelineChanged: true, guid: 'guid-0' } });
+    expect(await getMarkerTools(options).add_marker.handler({ time_seconds: .5005, name: 'Hook', comments: 'kept', color: 3 })).toMatchObject({ success: false, data: { outcome: 'committed_unverified', timelineChanged: true, guid: 'guid-0' } });
     expect(h.list).toHaveLength(1); expect(h.list[0].start.ticks).toBe('127135007999');
+    // The marker left behind is labelled, not blank.
+    expect(h.list[0]).toMatchObject({ name: 'Hook', comments: 'kept', color: 3 });
   });
   it("updates metadata without moving an existing early marker and exposes its clock", async () => {
     const h = host(); h.markers.createMarker(.5005);
@@ -94,6 +96,18 @@ describe("marker integer tick storage", () => {
       set start(value: number) { stored = String(Math.floor(value * TPS)); },
     };
     expect(runInNewContext(`${getHelpersSource()}\n__setMarkerTick(marker, "start", wanted)`, { marker, wanted })).toBe(true);
+    expect(stored).toBe(wanted);
+  });
+  it("keeps 16-digit clocks (past ~1:05:37) as decimal digits, as ExtendScript prints them in exponent form", () => {
+    // ExtendScript's toFixed(0) gives "1.0414656e+15" at 4100 s, which never equals Premiere's decimal Time.ticks.
+    const extendScriptNumbers = `var __toFixed = Number.prototype.toFixed; Number.prototype.toFixed = function (d) { return this >= 1e15 ? this.toExponential() : __toFixed.call(this, d); };`;
+    const wanted = String(4100 * TPS);
+    let stored = "0";
+    const marker = { get start() { return { get ticks() { return stored; }, set ticks(value: string) { stored = value; } }; } };
+    const run = (code: string) => runInNewContext(`${extendScriptNumbers}\n${getHelpersSource()}\n${code}`, { marker, wanted, n: 4100 * TPS });
+    expect(run(`__tickDigits(n)`)).toBe(wanted);
+    expect(run(`__tickDigits(9007199254740991)`)).toBe("9007199254740991");
+    expect(run(`__setMarkerTick(marker, "start", wanted)`)).toBe(true);
     expect(stored).toBe(wanted);
   });
   it.each([NaN, Infinity, -1])("refuses invalid marker time %s before dispatch", async time_seconds => {
