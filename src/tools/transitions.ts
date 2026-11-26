@@ -137,10 +137,10 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           ${TRANSITION_FAILURE_RECEIPT}
           app.enableQE();
           var qeSeq = qe.project.getActiveSequence();
-          if (!qeSeq) return __error("No active sequence (QE)");
+          if (!qeSeq) return __refuse("No active sequence (QE)");
 
           var qeTrack = qeSeq.getVideoTrackAt(${args.track_index});
-          if (!qeTrack) return __error("Track not found");
+          if (!qeTrack) return __refuse("Track not found");
 
           var transitionName = "${escapeForExtendScript(args.transition_name)}";
           var transitionQE = null;
@@ -166,13 +166,13 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
             } catch(e2) {}
           }
 
-          if (!transitionQE) return __error("Transition not found: " + transitionName);
+          if (!transitionQE) return __refuse("Transition not found: " + transitionName);
 
           var domTrack = app.project.activeSequence.videoTracks[${args.track_index}];
-          if (!domTrack) return __error("Track not found in the Premiere DOM");
+          if (!domTrack) return __refuse("Track not found in the Premiere DOM");
           var seq = app.project.activeSequence;
           var frameTicks = parseFloat(seq.timebase);
-          if (!frameTicks || isNaN(frameTicks)) return __error("The active sequence did not expose a valid timebase for transition duration.");
+          if (!frameTicks || isNaN(frameTicks)) return __refuse("The active sequence did not expose a valid timebase for transition duration.");
           // Snap the requested time to the frame grid and take the nearest clip
           // edge within half a frame: a cut point given to a few decimals (22.5892
           // for frame 677 at 29.97) is never within one tick of the edge.
@@ -189,7 +189,7 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
             var startDistance = Math.abs(parseFloat(candidate.start.ticks) - cutTicks);
             if (startDistance < bestDistance) { bestDistance = startDistance; edgeTicks = parseFloat(candidate.start.ticks); }
           }
-          if (edgeTicks === null) return __error("No video clip edge exists within half a frame of the requested cut point, so no transition was attempted.");
+          if (edgeTicks === null) return __refuse("No video clip edge exists within half a frame of the requested cut point, so no transition was attempted.");
           cutTicks = edgeTicks;
           for (var c1 = 0; c1 < domTrack.clips.numItems; c1++) {
             var candidate1 = domTrack.clips[c1];
@@ -205,12 +205,12 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           var targetHead = !!incomingClip;
           var qeClip = __findQeClipByDomClip(qeTrack, targetClip);
           if (!qeClip || typeof qeClip.addTransition !== "function") {
-            return __error("The target QE clip does not expose addTransition; no transition was attempted. The QE track itself is not the transition write surface.");
+            return __refuse("The target QE clip does not expose addTransition; no transition was attempted. The QE track itself is not the transition write surface.");
           }
 
           var durationFrames = Math.max(1, Math.round(__secondsToTicks(${duration}) / frameTicks));
           if (__newTransitionCovers(domTrack, {}, cutTicks, frameTicks)) {
-            return __error("A transition already covers the cut at ${args.cut_point_seconds}s on this track; no transition was attempted.");
+            return __refuse("A transition already covers the cut at ${args.cut_point_seconds}s on this track; no transition was attempted.");
           }
           var transitionKeysBefore = __transitionKeys(domTrack);
           var transitionCountBefore = domTrack.transitions.numItems;
@@ -304,11 +304,11 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           ${TRANSITION_FAILURE_RECEIPT}
           app.enableQE();
           var qeSeq = qe.project.getActiveSequence();
-          if (!qeSeq) return __error("No active sequence (QE)");
+          if (!qeSeq) return __refuse("No active sequence (QE)");
           
           var result = __findClip("${escapeForExtendScript(args.node_id)}");
-          if (!result) return __error("Clip not found");
-          if (result.trackType !== "video") return __error("Video transitions can only be added to a video clip; no transition was attempted.");
+          if (!result) return __refuse("Clip not found");
+          if (result.trackType !== "video") return __refuse("Video transitions can only be added to a video clip; no transition was attempted.");
           
           var transitionName = "${escapeForExtendScript(args.transition_name)}";
           var transitionQE = null;
@@ -321,19 +321,19 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
               }
             } catch(e2) {}
           }
-          if (!transitionQE) return __error("Transition not found: " + transitionName);
+          if (!transitionQE) return __refuse("Transition not found: " + transitionName);
 
           var qeTrack = qeSeq.getVideoTrackAt(result.trackIndex);
-          if (!qeTrack) return __error("QE video track not found");
+          if (!qeTrack) return __refuse("QE video track not found");
           var domTrack = app.project.activeSequence.videoTracks[result.trackIndex];
-          if (!domTrack) return __error("Video track not found in the Premiere DOM");
+          if (!domTrack) return __refuse("Video track not found in the Premiere DOM");
           var qeClip = __findQeClipByDomClip(qeTrack, result.clip);
           if (!qeClip || typeof qeClip.addTransition !== "function") {
-            return __error("The target QE clip does not expose addTransition; no transition was attempted. The QE track itself is not the transition write surface.");
+            return __refuse("The target QE clip does not expose addTransition; no transition was attempted. The QE track itself is not the transition write surface.");
           }
           var seq = app.project.activeSequence;
           var frameTicks = parseFloat(seq.timebase);
-          if (!frameTicks || isNaN(frameTicks)) return __error("The active sequence did not expose a valid timebase for transition duration.");
+          if (!frameTicks || isNaN(frameTicks)) return __refuse("The active sequence did not expose a valid timebase for transition duration.");
           var transitionCountBefore = domTrack.transitions.numItems;
           var transitionKeysBefore = __transitionKeys(domTrack);
           var durationFrames = Math.max(1, Math.round(__secondsToTicks(${duration}) / frameTicks));
@@ -344,10 +344,10 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           var clipStartTicks = parseFloat(clip.start.ticks);
           var clipEndTicks = parseFloat(clip.end.ticks);
           if ((position === "start" || position === "both") && __newTransitionCovers(domTrack, {}, clipStartTicks, frameTicks)) {
-            return __error("A transition already covers the clip start; no transition was attempted.");
+            return __refuse("A transition already covers the clip start; no transition was attempted.");
           }
           if ((position === "end" || position === "both") && __newTransitionCovers(domTrack, {}, clipEndTicks, frameTicks)) {
-            return __error("A transition already covers the clip end; no transition was attempted.");
+            return __refuse("A transition already covers the clip end; no transition was attempted.");
           }
           if (position === "start" || position === "both") requestedEdges.push({ edge: "start", ticks: clipStartTicks, seconds: __ticksToSeconds(clipStartTicks) });
           if (position === "end" || position === "both") requestedEdges.push({ edge: "end", ticks: clipEndTicks, seconds: __ticksToSeconds(clipEndTicks) });
@@ -444,10 +444,10 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           ${TRANSITION_FAILURE_RECEIPT}
           app.enableQE();
           var qeSeq = qe.project.getActiveSequence();
-          if (!qeSeq) return __error("No active sequence (QE)");
+          if (!qeSeq) return __refuse("No active sequence (QE)");
           
           var seq = app.project.activeSequence;
-          if (!seq) return __error("No active sequence");
+          if (!seq) return __refuse("No active sequence");
           
           var transitionName = "${escapeForExtendScript(args.transition_name)}";
           var transitionQE = null;
@@ -460,13 +460,13 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
               }
             } catch(e2) {}
           }
-          if (!transitionQE) return __error("Transition not found: " + transitionName);
+          if (!transitionQE) return __refuse("Transition not found: " + transitionName);
 
           var track = seq.videoTracks[${trackIndex}];
           var qeTrack = qeSeq.getVideoTrackAt(${trackIndex});
-          if (!track || !qeTrack) return __error("Video track not found");
+          if (!track || !qeTrack) return __refuse("Video track not found");
           var frameTicks = parseFloat(seq.timebase);
-          if (!frameTicks || isNaN(frameTicks)) return __error("The active sequence did not expose a valid timebase for transition duration.");
+          if (!frameTicks || isNaN(frameTicks)) return __refuse("The active sequence did not expose a valid timebase for transition duration.");
           var durationFrames = Math.max(1, Math.round(__secondsToTicks(${duration}) / frameTicks));
           var transitionCountBefore = track.transitions.numItems;
           var transitionKeysBefore = __transitionKeys(track);

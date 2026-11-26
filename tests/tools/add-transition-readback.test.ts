@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runInNewContext } from "node:vm";
 import { getHelpersSource } from "../../src/bridge/script-builder.js";
 import type { BridgeOptions } from "../../src/bridge/file-bridge.js";
+import { runWithUndoTracking } from "../../src/bridge/undo-tracking.js";
+import { mutationReceipt } from "../../src/workflows/mutation-receipt.js";
 
 vi.mock("../../src/bridge/file-bridge.js", () => ({
   sendCommand: vi.fn().mockResolvedValue({ success: true, data: {} }),
@@ -74,7 +76,9 @@ function hostWith(place: (cutSeconds: number) => [number, number], existing: Arr
     qe: {
       project: {
         getActiveSequence: () => ({ getVideoTrackAt: () => ({ numItems: qeClips.length, getItemAt: (i: number) => qeClips[i] }) }),
-        getVideoTransitionByName: (name: string) => ({ name }),
+        getVideoTransitionByName: (name: string) => (name === "Cross Dissolve" ? { name } : null),
+        getVideoTransitionList: () => ({ numItems: 0 }),
+        undoStackIndex: () => 7,
       },
     },
   };
@@ -260,5 +264,42 @@ describe("transition readback ignores transitions that were already there", () =
     hostWith((cut) => [cut + 5.5, cut + 6.5]);
     await expect(tools.add_transition_to_clip.handler({ node_id: "n2", transition_name: "Cross Dissolve", position: "start" }))
       .resolves.toMatchObject({ success: false, data: { outcome: "committed_unverified", timelineChanged: true, startVerified: false } });
+  });
+});
+
+describe("transition refusals before any write", () => {
+  type Refusal = { success: boolean; error?: string; data?: Record<string, unknown> };
+  // Dispatched under undo tracking, as the server does: each refusal must be
+  // not_applied so it does not leave a recovery lock.
+  const refuses = async (name: string, call: () => Promise<unknown>, message: string) => {
+    const result = await runWithUndoTracking(true, call) as Refusal;
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining(message), data: { mutationOutcome: "not_applied", timelineChanged: false, refusedBeforeChange: true } });
+    expect(mutationReceipt(false, result.data, { dispatched: true }, name).outcome).toBe("not_applied");
+  };
+
+  it.each([
+    ["a cut point away from any clip edge", 6.03, "Cross Dissolve", "within half a frame"],
+    ["an unknown transition name", 6, "Nope Dissolve", "Transition not found"],
+  ])("add_transition: %s", async (_label, cut, transition, message) => {
+    const host = hostWith((c) => [c - 0.5, c + 0.5]);
+    await refuses("add_transition", () => tools.add_transition.handler({ transition_name: transition, track_index: 0, cut_point_seconds: cut, duration_seconds: 1 }), message);
+    expect(host.calls()).toBe(0);
+  });
+
+  it("add_transition: a cut that already has a transition", async () => {
+    hostWith((c) => [c - 0.5, c + 0.5], [[5.5, 6.5]]);
+    await refuses("add_transition", () => add(6), "already covers the cut");
+  });
+
+  it("add_transition_to_clip: a stale clip ID", async () => {
+    const host = hostWith((c) => [c - 0.5, c + 0.5]);
+    await refuses("add_transition_to_clip", () => tools.add_transition_to_clip.handler({ node_id: "gone", transition_name: "Cross Dissolve", position: "start" }), "Clip not found");
+    expect(host.calls()).toBe(0);
+  });
+
+  it("batch_add_transitions: an unknown transition name", async () => {
+    const host = hostWith((c) => [c - 0.5, c + 0.5]);
+    await refuses("batch_add_transitions", () => tools.batch_add_transitions.handler({ transition_name: "Nope Dissolve", track_index: 0 }), "Transition not found");
+    expect(host.calls()).toBe(0);
   });
 });
