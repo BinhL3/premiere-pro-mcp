@@ -12,6 +12,8 @@ vi.mock("../../src/bridge/file-bridge.js", () => ({
 
 import { sendCommand } from "../../src/bridge/file-bridge.js";
 import { getAdvancedTools } from "../../src/tools/advanced.js";
+import { runWithUndoTracking } from "../../src/bridge/undo-tracking.js";
+import { mutationReceipt } from "../../src/workflows/mutation-receipt.js";
 
 const mockedSendCommand = vi.mocked(sendCommand);
 const bridgeOptions: BridgeOptions = { tempDir: "/tmp/ripple-sync-lock", timeoutMs: 5000 };
@@ -153,6 +155,7 @@ function rippleHost(options: {
     },
     qe: {
       project: {
+        undoStackIndex: () => 12,
         getActiveSequence() {
           return {
             getVideoTrackAt(index: number) {
@@ -285,5 +288,32 @@ describe("ripple_delete and the clip's linked partners", () => {
     expect(rangesOf(v1)).toEqual([[0, 6]]);
     expect(rangesOf(v2)).toEqual([[4, 8]]);
     expect(rangesOf(a1)).toEqual([[0, 4], [4, 10]]);
+  });
+});
+
+describe("ripple_delete refusals are not_applied", () => {
+  // Dispatched under undo tracking, as the server does: a refusal before any
+  // change must not leave a recovery lock.
+  async function refusal(args: Record<string, unknown>, host: ReturnType<typeof rippleHost>) {
+    mockedSendCommand.mockImplementation(async (script: string) => runScript(script, host.sandbox));
+    const result = await runWithUndoTracking(true, () => getAdvancedTools(bridgeOptions).ripple_delete.handler(args as never)) as { success: boolean; error?: string; data?: Record<string, unknown> };
+    expect(result).toMatchObject({ success: false, data: { mutationOutcome: "not_applied", timelineChanged: false, refusedBeforeChange: true } });
+    expect(mutationReceipt(false, result.data, { dispatched: true }, "ripple_delete").outcome).toBe("not_applied");
+    expect(mockedSendCommand).toHaveBeenCalledTimes(1);
+    return result;
+  }
+
+  it("refuses a stale clip ID", async () => {
+    const host = rippleHost();
+    const result = await refusal({ node_id: "gone" }, host);
+    expect(result.error).toBe("Clip not found: gone");
+    expect(rangesOf(host.v1)).toEqual([[0, 4], [4, 10]]);
+  });
+
+  it("refuses an unrelated clip inside the range", async () => {
+    const host = rippleHost({ targetAudio: "unlinked" });
+    const result = await refusal({ node_id: "v1-target" }, host);
+    expect(result.error).toMatch(/sits inside the range being closed/);
+    expect(rangesOf(host.a1)).toEqual([[0, 4], [4, 10]]);
   });
 });

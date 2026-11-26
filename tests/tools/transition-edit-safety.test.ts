@@ -67,6 +67,9 @@ describe("transition-safe structural edits", () => {
     const h=fixture(); const remove=vi.fn();
     h.track.clips.push({nodeId:"clip",name:"Clip",start:time(0),end:time(1),getLinkedItems:()=>null,remove});
     expect(h.run('(function(){'+rippleDeleteScriptBody({nodeId:"clip",scope:"own_track",rangeDelete:false,dryRun:false})+'})()')).toMatchObject({success:false,data:{transitionsAffected:[{index:0}],timelineChanged:false}});
+    // Inside an edit plan, __result/__error/__refuse are shadowed and the body must hand back a plain object.
+    const wrapped = 'var __result = function (d) { return { success: true, data: d }; }; var __error = function (m, d) { return { success: false, error: String(m), data: d }; }; var __refuse = __error; ';
+    expect(h.run('var step = (function(){'+wrapped+rippleDeleteScriptBody({nodeId:"clip",scope:"own_track",rangeDelete:false,dryRun:false})+'})(); __result({type: typeof step, step: step});').data).toMatchObject({type:"object",step:{success:false,data:{transitionsAffected:[{index:0}],timelineChanged:false}}});
     expect(remove).not.toHaveBeenCalled();
   });
   it("accepts readable empty tracks and leaves unrelated earlier transitions alone", () => {

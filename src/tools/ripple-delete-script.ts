@@ -1,6 +1,6 @@
 /**
  * Script body for an explicit, verified ripple delete of one clip (plus its
- * linked partners) in the active sequence. Returns via __result/__error, so run
+ * linked partners) in the active sequence. Returns via __result/__refuse/__error, so run
  * it as a whole tool script or inside its own function. `nodeId` must already be
  * escaped for ExtendScript.
  */
@@ -18,7 +18,7 @@ export function rippleDeleteScriptBody(options: {
   const largeRippleThreshold = options.largeRippleThreshold ?? 400;
   return `
           var result = __findClip("${nodeId}");
-          if (!result) return __error("Clip not found: ${nodeId}");
+          if (!result) return __refuse("Clip not found: ${nodeId}");
           // The clip's own linked partners (its synced audio/video) are part of
           // the edit, exactly as in Premiere's ripple delete of a linked clip.
           var linkedPartnerIds = {};
@@ -26,7 +26,7 @@ export function rippleDeleteScriptBody(options: {
           for (var lpi = 0; lpi < linkedPartners.length; lpi++) linkedPartnerIds[String(linkedPartners[lpi].clip.nodeId)] = true;
 
           var seq = app.project.activeSequence;
-          if (!seq) return __error("No active sequence");
+          if (!seq) return __refuse("No active sequence");
           var frameTicks = seq && seq.timebase ? parseFloat(seq.timebase) : NaN;
           if (!frameTicks || isNaN(frameTicks)) frameTicks = TICKS_PER_SECOND / 24;
           var tol = frameTicks;
@@ -36,12 +36,12 @@ export function rippleDeleteScriptBody(options: {
           var gapStartT = parseFloat(target.start.ticks);
           var gapEndT = parseFloat(target.end.ticks);
           var shiftT = gapEndT - gapStartT;
-          if (!(shiftT > 0)) return __error("The target clip has no positive duration; nothing to ripple.");
+          if (!(shiftT > 0)) return __refuse("The target clip has no positive duration; nothing to ripple.");
 
           // Sync-lock state is only exposed through QE, not the public DOM.
           app.enableQE();
           var qeSeq = qe.project.getActiveSequence();
-          if (!qeSeq) return __error("No active sequence (QE); cannot read sync-lock state, so the set of tracks to shift cannot be determined safely.");
+          if (!qeSeq) return __refuse("No active sequence (QE); cannot read sync-lock state, so the set of tracks to shift cannot be determined safely.");
 
           function qeTrackFor(type, idx) {
             return type === "video" ? qeSeq.getVideoTrackAt(idx) : qeSeq.getAudioTrackAt(idx);
@@ -73,7 +73,7 @@ export function rippleDeleteScriptBody(options: {
               if (qv && typeof qv.isSyncLocked === "function") slv = !!qv.isSyncLocked();
             } catch (e1) { slv = null; }
             if (slv === null) {
-              return __error("Ripple delete refused; nothing was changed. Could not read isSyncLocked() on video track " + ti + ". Pass scope 'own_track' to shift only the clip's track (this will desync other tracks).");
+              return __refuse("Ripple delete refused; nothing was changed. Could not read isSyncLocked() on video track " + ti + ". Pass scope 'own_track' to shift only the clip's track (this will desync other tracks).");
             }
             if (slv) addPart("video", ti, false);
           }
@@ -85,7 +85,7 @@ export function rippleDeleteScriptBody(options: {
               if (qa && typeof qa.isSyncLocked === "function") sla = !!qa.isSyncLocked();
             } catch (e2) { sla = null; }
             if (sla === null) {
-              return __error("Ripple delete refused; nothing was changed. Could not read isSyncLocked() on audio track " + ti + ". Pass scope 'own_track' to shift only the clip's track (this will desync other tracks).");
+              return __refuse("Ripple delete refused; nothing was changed. Could not read isSyncLocked() on audio track " + ti + ". Pass scope 'own_track' to shift only the clip's track (this will desync other tracks).");
             }
             if (sla) addPart("audio", ti, false);
           }
@@ -117,12 +117,12 @@ export function rippleDeleteScriptBody(options: {
               } catch (e3) { lk = null; }
             }
             if (lk === null) {
-              return __error("Ripple delete refused; nothing was changed. Could not read isLocked() on " + parts[pi].type + " track " + parts[pi].index + ". Unlock them or use scope 'own_track' (which will desync other tracks).");
+              return __refuse("Ripple delete refused; nothing was changed. Could not read isLocked() on " + parts[pi].type + " track " + parts[pi].index + ". Unlock them or use scope 'own_track' (which will desync other tracks).");
             }
             if (lk) lockedList.push(parts[pi].type + " track " + parts[pi].index);
           }
           if (lockedList.length) {
-            return __error("Ripple delete refused; nothing was changed. These tracks must shift but are locked: " + lockedList.join(", ") + ". Unlock them or use scope 'own_track' (which will desync other tracks).");
+            return __refuse("Ripple delete refused; nothing was changed. These tracks must shift but are locked: " + lockedList.join(", ") + ". Unlock them or use scope 'own_track' (which will desync other tracks).");
           }
 
           // Pre-flight every participating track BEFORE mutating anything.
@@ -164,12 +164,12 @@ export function rippleDeleteScriptBody(options: {
           }
 
           if (problems.length) {
-            return __error("Ripple delete refused; nothing was changed. " + problems.join("; ") + ". Trim or move the offending clip(s) first, use range_content 'delete' to also remove clips that sit entirely inside the range, or use scope 'own_track' if desyncing other tracks is acceptable.");
+            return __refuse("Ripple delete refused; nothing was changed. " + problems.join("; ") + ". Trim or move the offending clip(s) first, use range_content 'delete' to also remove clips that sit entirely inside the range, or use scope 'own_track' if desyncing other tracks is acceptable.");
           }
 
           var transitionScopes = [];
           for (var tsi = 0; tsi < parts.length; tsi++) transitionScopes.push({ type: parts[tsi].type, index: parts[tsi].index, start: gapStartT, end: Number.MAX_VALUE });
-          var transitionFailure = __transitionEditGuard(seq, transitionScopes);
+          var transitionFailure = __transitionEditGuard(seq, transitionScopes, __error);
           if (transitionFailure) return transitionFailure;
 
           var planSummary = [];
