@@ -1,3 +1,4 @@
+import { performanceDiagnostics } from "../workflows/performance-diagnostics.js";
 import {
   createReadStream,
   existsSync,
@@ -306,9 +307,19 @@ export function collectBridgeTelemetry(
       ...blockingInput,
       runningToolCalls: blockingInput.runningToolCalls ?? runningOperations(OPERATION_LOG_LIMIT).operations,
     }),
+    stageTimingMs: stageTimingMedians(),
     privacy:
       "Aggregate local bridge state only; no paths, filenames, script contents, project names, or media names are returned.",
   };
+}
+
+/** Median ms per measured bridge stage over this process's recent calls; get_operation_performance has the full distributions. */
+function stageTimingMedians(): Record<string, number> {
+  const medians: Record<string, number> = {};
+  for (const [stage, distribution] of Object.entries(performanceDiagnostics().stagesMs)) {
+    if (distribution.median !== null) medians[stage] = Math.round(distribution.median * 10) / 10;
+  }
+  return medians;
 }
 
 function projectSnapshot(result: CommandResult): ProjectSnapshot | null {
@@ -406,7 +417,7 @@ export function getRecoveryTools(bridgeOptions: BridgeOptions) {
 
     get_bridge_telemetry: {
       description:
-        "Read-only, sends no command: inspect privacy-preserving aggregate bridge health (pending command/response counts, busy operations, queue age, CEP heartbeat state) and diagnose whether the CEP bridge is blocked. Use it after a timeout or before retrying: a modal dialog such as Missing Media blocks Premiere's scripting engine, so a probe script cannot run. blocking.state is idle, busy, likely_blocked_by_dialog, stuck, connector_not_running, or unknown, with reason, ages in ms, queued counts, the running tool name when known, and nextSteps. It reads only heartbeat and busy-marker timing; no OS window probe is performed (macOS needs Accessibility permission and window titles can name media), and no dialog is dismissed. Returns no paths, file names, or script contents.",
+        "Read-only, sends no command: inspect privacy-preserving aggregate bridge health (pending command/response counts, busy operations, queue age, CEP heartbeat state) and diagnose whether the CEP bridge is blocked. Use it after a timeout or before retrying: a modal dialog such as Missing Media blocks Premiere's scripting engine, so a probe script cannot run. blocking.state is idle, busy, likely_blocked_by_dialog, stuck, connector_not_running, or unknown, with reason, ages in ms, queued counts, the running tool name when known, and nextSteps. It reads only heartbeat and busy-marker timing; no OS window probe is performed (macOS needs Accessibility permission and window titles can name media), and no dialog is dismissed. stageTimingMs gives the median ms per bridge stage (dispatch, pickup, host_eval, bridge_transit, readback, lease_acquire, queue_wait) over recent calls. Returns no paths, file names, or script contents.",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       parameters: {
         type: "object" as const,

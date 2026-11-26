@@ -607,6 +607,18 @@ describe("sendCommand", () => {
     expect(mockedReadFileSync.mock.calls.some(([path]) => String(path).endsWith(`res_${id}.json`))).toBe(true);
   });
 
+  it("records the host's own evaluation time as stages and strips it from the result", async () => {
+    mockedExistsSync.mockImplementation((path) => !String(path).endsWith("bridge-heartbeat.json") && !String(path).includes("cmd_"));
+    mockedReadFileSync.mockReturnValue('{"__hostEvalMs":12,"success":true,"data":{"verified":true}}');
+    await withInvocationContext({}, async () => {
+      const result = await sendCommand("(function() {\n  try {\n    __undoStart = null;\n  } catch(e) {}\n})();", { tempDir: "/tmp/test-bridge" });
+      expect(result).toEqual({ success: true, data: { verified: true } });
+      const published = String(mockedWriteFileSync.mock.calls.at(-1)?.[1]);
+      expect(published).toContain("var __mcpR = (function()");
+      expect(currentInvocation()!.stages).toMatchObject({ host_eval: 12, bridge_transit: expect.any(Number) });
+    });
+  });
+
   it("returns parsed JSON response", async () => {
     mockedExistsSync.mockImplementation((path) => {
       if (String(path).includes("res_")) return true;

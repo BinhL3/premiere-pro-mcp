@@ -76,6 +76,7 @@ import { getTranscriptWordEditTools } from "./tools/transcript-word-edits.js";
 import { getPlatformDeliveryTools } from "./tools/platform-delivery.js";
 import { getEditorRequestTools } from "./tools/editor-requests.js";
 import { getReviewPlanTools } from "./tools/review-plans.js";
+import { BATCH_OPERATIONS, getBatchOpsTools } from "./tools/batch-ops.js";
 import { getExecutionWorkflowTools } from "./tools/execution-workflows.js";
 import { getOperationRecoveryTools } from "./tools/operation-recovery.js";
 import { getTimelineEditorialTools } from "./tools/timeline-editorial.js";
@@ -454,6 +455,7 @@ export function collectTools(
     tools,
     getTimelineEditorialTools(bridgeOptions, { getToolCatalog: getCompositionCatalog, capabilities }),
     getExecutionWorkflowTools(bridgeOptions, { getToolCatalog: getCompositionCatalog, capabilities, uxpBridge: selectedUxpBridge }),
+    getBatchOpsTools(bridgeOptions, { getToolCatalog: getCompositionCatalog, capabilities, schemas: Object.fromEntries(BATCH_OPERATIONS.map(name => [name, tools[name]?.parameters as Record<string, unknown> | undefined])) }),
     getHealthTools(bridgeOptions, capabilities, () => tools, {
       telemetry,
       uxpBridge,

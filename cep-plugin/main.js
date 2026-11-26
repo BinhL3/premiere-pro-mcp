@@ -484,6 +484,34 @@ function startBridge() {
   pollInterval = setInterval(function () {
     if (bridgeRunning) processCommands();
   }, POLL_MS);
+  startCommandWatcher();
+}
+
+// A directory watch picks a new command up as soon as the server publishes it,
+// instead of up to POLL_MS later. The poll above stays as the fallback for
+// filesystems that drop or coalesce events.
+var commandWatcher = null;
+function startCommandWatcher() {
+  stopCommandWatcher();
+  try {
+    commandWatcher = fs.watch(tempDir, { persistent: false }, function (event, filename) {
+      if (!bridgeRunning) return;
+      var name = filename ? String(filename) : "";
+      if (name && !(name.indexOf("cmd_") === 0 && name.slice(-4) === ".jsx")) return;
+      processCommands();
+    });
+    commandWatcher.on("error", stopCommandWatcher);
+  } catch (watchError) {
+    commandWatcher = null;
+  }
+}
+
+function stopCommandWatcher() {
+  var watcher = commandWatcher;
+  commandWatcher = null;
+  if (watcher) {
+    try { watcher.close(); } catch (closeError) {}
+  }
 }
 
 function stopBridge() {
@@ -492,6 +520,7 @@ function stopBridge() {
   stopBridgeHeartbeat();
   if (pollInterval) clearInterval(pollInterval);
   pollInterval = null;
+  stopCommandWatcher();
 
   setStatus("", "Stopped");
   refreshConnectionCenter();

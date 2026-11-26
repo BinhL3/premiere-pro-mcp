@@ -139,7 +139,10 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           var qeSeq = qe.project.getActiveSequence();
           if (!qeSeq) return __refuse("No active sequence (QE)");
 
-          var qeTrack = qeSeq.getVideoTrackAt(${args.track_index});
+          // QE throws, rather than returning null, for a track index past the end.
+          if (${args.track_index} >= app.project.activeSequence.videoTracks.numTracks) return __refuse("Video track ${args.track_index} does not exist; no transition was attempted.");
+          var qeTrack = null;
+          try { qeTrack = qeSeq.getVideoTrackAt(${args.track_index}); } catch (qeTrackError) {}
           if (!qeTrack) return __refuse("Track not found");
 
           var transitionName = "${escapeForExtendScript(args.transition_name)}";
@@ -152,6 +155,8 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
               transitionQE = qe.project.getVideoTransitionByName(transitionName);
             }
           } catch(e1) {}
+          // Premiere 27 returns an unnamed object for any unknown name.
+          if (transitionQE && String(transitionQE.name || "") === "") transitionQE = null;
 
           // Resolution path 2: scan getVideoTransitionList (legacy).
           if (!transitionQE) {
@@ -313,6 +318,7 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           var transitionName = "${escapeForExtendScript(args.transition_name)}";
           var transitionQE = null;
           try { if (qe.project.getVideoTransitionByName) transitionQE = qe.project.getVideoTransitionByName(transitionName); } catch(e1) {}
+          if (transitionQE && String(transitionQE.name || "") === "") transitionQE = null;
           if (!transitionQE) {
             try {
               var transitions = __qeCatalogFrom(qe.project.getVideoTransitionList());
@@ -452,6 +458,7 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           var transitionName = "${escapeForExtendScript(args.transition_name)}";
           var transitionQE = null;
           try { if (qe.project.getVideoTransitionByName) transitionQE = qe.project.getVideoTransitionByName(transitionName); } catch(e1) {}
+          if (transitionQE && String(transitionQE.name || "") === "") transitionQE = null;
           if (!transitionQE) {
             try {
               var transitions = __qeCatalogFrom(qe.project.getVideoTransitionList());
@@ -462,8 +469,9 @@ export function getTransitionsTools(bridgeOptions: BridgeOptions) {
           }
           if (!transitionQE) return __refuse("Transition not found: " + transitionName);
 
-          var track = seq.videoTracks[${trackIndex}];
-          var qeTrack = qeSeq.getVideoTrackAt(${trackIndex});
+          var track = ${trackIndex} < seq.videoTracks.numTracks ? seq.videoTracks[${trackIndex}] : null;
+          var qeTrack = null;
+          if (track) { try { qeTrack = qeSeq.getVideoTrackAt(${trackIndex}); } catch (qeTrackError) {} }
           if (!track || !qeTrack) return __refuse("Video track not found");
           var frameTicks = parseFloat(seq.timebase);
           if (!frameTicks || isNaN(frameTicks)) return __refuse("The active sequence did not expose a valid timebase for transition duration.");

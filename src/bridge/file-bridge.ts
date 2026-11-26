@@ -7,8 +7,9 @@ import { getHelpersSource, helpersFileName, buildBootstrap } from "./script-buil
 import { validateBridgeScriptSize } from "./script-size.js";
 import { withHostLease, ownsHostLease, inspectHostRecovery, markHostRecovery, HostLeaseError } from "./host-lease.js";
 import { undoTrackingEnabled } from "./undo-tracking.js";
-import { assertInvocationNotCancelled, currentInvocation, markHostDispatch, measureStage, measureStageSync, reportHostHeartbeat, startStage } from "../workflows/invocation-context.js";
-import { AsyncResource } from "node:async_hooks";
+import { addStage, assertInvocationNotCancelled, currentInvocation, markHostDispatch, measureStage, measureStageSync, reportHostHeartbeat, startStage } from "../workflows/invocation-context.js";
+import { performance } from "node:perf_hooks";
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 
 export function getDarwinUserTempDirectory(): string | null {
   try {
@@ -42,6 +43,11 @@ export function getDefaultBridgeTempDir(
 
 const DEFAULT_TEMP_DIR = getDefaultBridgeTempDir();
 const POLL_FALLBACK_MS = 250;
+// Most commands answer within a second or two. Directory events can arrive
+// batched (macOS FSEvents), so poll briefly at a short interval first: an
+// existence check costs microseconds and bounds reply detection to this delay.
+const FAST_POLL_MS = 10;
+const FAST_POLL_WINDOW_MS = 2_000;
 const DEFAULT_TIMEOUT_MS = 30000;
 export const MAX_QUEUED_BRIDGE_COMMANDS = 32;
 export const MAX_BRIDGE_RESPONSE_BYTES = 1_048_576;
@@ -597,9 +603,31 @@ export async function sendCommand(
   options?: BridgeOptions
 ): Promise<CommandResult> {
   validateScript(script);
+  const capture = bridgeCapture.getStore();
+  if (capture) return capture.send(script, options);
   const tempDir = getTempDir(options);
   return executeOwnedCommand(tempDir, options, () => sendCommandUnchecked(script, options));
 }
+
+/**
+ * apply_batch runs ordinary tool handlers with their sendCommand calls
+ * intercepted, so each handler's own validation and generated script are reused
+ * inside one batch command. Nothing reaches Premiere while a capture is active
+ * except what the capture itself chooses to send.
+ */
+export interface BridgeCapture {
+  send(script: string, options?: BridgeOptions): Promise<CommandResult>;
+}
+const bridgeCapture = new AsyncLocalStorage<BridgeCapture>();
+export function runWithBridgeCapture<T>(capture: BridgeCapture, work: () => T): T {
+  return bridgeCapture.run(capture, work);
+}
+export function bridgeCaptureActive(): boolean { return bridgeCapture.getStore() !== undefined; }
+/** Run work outside any active capture (the capture's own real dispatches). */
+export function runWithoutBridgeCapture<T>(work: () => T): T {
+  return bridgeCapture.exit(work);
+}
+const CAPTURE_UNSUPPORTED: CommandResult = { success: false, data: { mutationOutcome: "not_applied", dispatched: false }, error: "BATCH_UNSUPPORTED: this operation needs a raw or panel command, which apply_batch cannot include; nothing was sent." };
 
 /** Hold one cooperating-process lease across a tool's inspect/apply/readback calls. */
 export async function withBridgeWorkflow<T>(options: BridgeOptions | undefined, work: () => Promise<T>): Promise<T> {
@@ -609,22 +637,29 @@ export async function withBridgeWorkflow<T>(options: BridgeOptions | undefined, 
   // Reuse the bounded scheduler for the entire workflow. Nested commands bypass
   // it under the inherited lease, avoiding a queue/lease inversion deadlock.
   const finishQueue = startStage("queue_wait");
-  return scheduleBridgeCommand(tempDir, () => withHostLease(tempDir, options?.timeoutMs || DEFAULT_TIMEOUT_MS, async () => {
+  let finishLease = () => {};
+  return scheduleBridgeCommand(tempDir, () => {
     finishQueue();
-    return { success: true, data: await work() };
-  })).then((result) => {
+    finishLease = startStage("lease_acquire");
+    return withHostLease(tempDir, options?.timeoutMs || DEFAULT_TIMEOUT_MS, async () => {
+      finishLease();
+      return { success: true, data: await work() };
+    });
+  }).then((result) => {
     if (!result.success) throw new HostLeaseError("HOST_WORKFLOW_QUEUE_FULL", result.error || "Protected workflow queue is full");
     return result.data as T;
-  }).finally(finishQueue);
+  }).finally(() => { finishQueue(); finishLease(); });
 }
 async function executeOwnedCommand(tempDir: string, options: BridgeOptions | undefined, work: () => Promise<CommandResult>): Promise<CommandResult> {
   ensurePrivateBridgeDirectory(tempDir);
   const nested = ownsHostLease(tempDir);
   const finishQueue = nested ? () => {} : startStage("queue_wait");
   const run = async () => {
+    const finishLease = nested ? () => {} : startStage("lease_acquire");
     try {
       return await withHostLease(tempDir, options?.timeoutMs || DEFAULT_TIMEOUT_MS, async () => {
         finishQueue();
+        finishLease();
         const mutating = options?.mutating ?? (options?.mutationOnTimeout === true || undoTrackingEnabled());
         if (mutating && !getBridgeCompatibility(options).compatible) return { success: false, data: { mutationOutcome: "not_applied" }, error: "CEP_SCHEMA_INCOMPATIBLE: install the matching CEP panel before editing; no command was dispatched" };
         if (mutating && inspectHostRecovery(tempDir).recoveryRequired) return { success: false, data: { mutationOutcome: "not_applied", recoveryRequired: true }, error: "HOST_RECOVERY_REQUIRED: inspect current Premiere state and acknowledge the matching recovery revision before another edit" };
@@ -661,6 +696,7 @@ export async function sendPanelCommand(
 ): Promise<CommandResult> {
   const body = `${PANEL_COMMAND_MARKER}${JSON.stringify(payload)}`;
   validateBridgeScriptSize(body);
+  if (bridgeCapture.getStore()) return CAPTURE_UNSUPPORTED;
   const tempDir = getTempDir(options);
   return executeOwnedCommand(tempDir, options, () => sendCommandUnchecked(body, options, false));
 }
@@ -691,8 +727,7 @@ async function sendCommandUnchecked(
     // Write a complete command before its .jsx name makes it visible to CEP.
     // renameSync is atomic when both paths are in the bridge directory.
     measureStageSync("dispatch", () => {
-    writeExclusiveBridgeFile(stagedCmdFile, withHelpers ? `${ensureHelpers(tempDir, options?.helpers)}
-${script}` : script);
+    writeExclusiveBridgeFile(stagedCmdFile, withHelpers ? withHostEvalTiming(ensureHelpers(tempDir, options?.helpers), script) : script);
     stagedOwned = true;
     assertInvocationNotCancelled();
     renameSync(stagedCmdFile, cmdFile);
@@ -711,6 +746,28 @@ ${script}` : script);
       safeUnlink(busyFile);
     }
   }
+}
+
+// buildScript() output is one IIFE expression statement. Only that exact shape
+// is wrapped, so a script whose completion value comes from a later statement
+// is never changed.
+const BUILT_SCRIPT_PREFIX = /^\(function\(\) \{\s*try \{\s*__undoStart = null;/;
+export const HOST_EVAL_MS_FIELD = "__hostEvalMs";
+
+/**
+ * Prefix the command with a host clock read and splice the ExtendScript
+ * evaluation time (helper bootstrap included) into the JSON reply, so stage
+ * timing can separate host work from bridge transit. The field is removed
+ * again before any caller sees the result.
+ */
+export function withHostEvalTiming(bootstrap: string, script: string): string {
+  const trimmed = script.trimEnd();
+  if (!BUILT_SCRIPT_PREFIX.test(script) || !trimmed.endsWith("})();")) return `${bootstrap}
+${script}`;
+  return `var __mcpT0 = new Date().getTime();
+${bootstrap}
+var __mcpR = ${trimmed.slice(0, -1)};
+(typeof __mcpR === "string" && __mcpR.charAt(0) === "{" && __mcpR.charAt(1) === '"') ? '{"${HOST_EVAL_MS_FIELD}":' + (new Date().getTime() - __mcpT0) + "," + __mcpR.substring(1) : __mcpR;`;
 }
 
 function validateScript(script: string, allowUnsafe = false): void {
@@ -742,6 +799,7 @@ export async function sendRawCommand(
   options?: BridgeOptions
 ): Promise<CommandResult> {
   validateScript(script, true);
+  if (bridgeCapture.getStore()) return CAPTURE_UNSUPPORTED;
   const tempDir = getTempDir(options);
   return executeOwnedCommand(tempDir, options, () => sendRawCommandUnchecked(script, options));
 }
@@ -818,6 +876,12 @@ async function pollForResponse(
   // Captured here: the shared response watcher can call check() from another
   // invocation's async context, which must never receive this command's heartbeat.
   const invocation = currentInvocation();
+  // Stage timing: publish -> panel claim (the cmd file disappears) -> reply.
+  // A claim is seen only through directory events; without one, pickup stays unmeasured.
+  const publishedAt = performance.now();
+  const commandFile = join(dirname(resFile), basename(resFile).replace(/^res_/, "cmd_").replace(/\.json$/, ".jsx"));
+  let pickedUpAt: number | null = null;
+  const noteClaim = () => { if (pickedUpAt === null && !existsSync(commandFile)) pickedUpAt = performance.now(); };
   let lastHeartbeatAt = start;
   const heartbeat = (elapsed: number) => {
     if (!invocation?.notify || invocation.progressToken === undefined) return;
@@ -853,13 +917,15 @@ async function pollForResponse(
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
     let stopWatching = () => {};
-    let fallbackDelay = 100;
 
+
+    let stopWatchingClaim = () => {};
     const finish = (result: CommandResult) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       stopWatching();
+      stopWatchingClaim();
       resolve(result);
     };
     // Point Premiere clients at the no-command blocking diagnosis. Companion
@@ -870,8 +936,7 @@ async function pollForResponse(
 
     const scheduleFallback = () => {
       if (!settled) {
-        timer = setTimeout(check, fallbackDelay);
-        fallbackDelay = POLL_FALLBACK_MS;
+        timer = setTimeout(check, Date.now() - start < FAST_POLL_WINDOW_MS ? FAST_POLL_MS : POLL_FALLBACK_MS);
       }
     };
 
@@ -879,7 +944,8 @@ async function pollForResponse(
       if (settled) return;
       if (existsSync(resFile)) {
         try {
-          const responseSize = statSync(resFile).size;
+          const responseStat = statSync(resFile);
+          const responseSize = responseStat.size;
           if (responseSize > MAX_BRIDGE_RESPONSE_BYTES) {
             finish({
               success: false,
@@ -898,6 +964,8 @@ async function pollForResponse(
             });
             return;
           } else {
+            recordTransitStages(invocation, performance.now() - publishedAt, pickedUpAt === null ? null : pickedUpAt - publishedAt, takeHostEvalMs(result));
+            addStage("reply_notice", Math.max(0, Date.now() - responseStat.mtimeMs), invocation);
             finish(result);
             return;
           }
@@ -938,8 +1006,7 @@ async function pollForResponse(
           finish({ success: false, error: lastResponseParseError });
           return;
         }
-        const cmdFile = join(dirname(resFile), basename(resFile).replace(/^res_/, "cmd_").replace(/\.json$/, ".jsx"));
-        const queuedState = cancelQueuedBehindLivePanel(cmdFile, busyFile, hardCapMs);
+        const queuedState = cancelQueuedBehindLivePanel(commandFile, busyFile, hardCapMs);
         const panelHostName = hostLabel === "Premiere Pro" ? "Premiere" : hostLabel;
         finishTimedOut({
           success: false,
@@ -976,8 +1043,25 @@ async function pollForResponse(
     // allocating one fs.watch handle per concurrent command. The timer above
     // still protects against missed or coalesced filesystem events.
     stopWatching = watchResponseFile(resFile, check);
+    stopWatchingClaim = watchResponseFile(commandFile, noteClaim);
     check();
   });
+}
+
+/** Remove the host clock field the timing wrapper spliced into a reply. */
+function takeHostEvalMs(result: CommandResult): number | null {
+  const record = result as unknown as Record<string, unknown>;
+  const value = record[HOST_EVAL_MS_FIELD];
+  if (value === undefined) return null;
+  delete record[HOST_EVAL_MS_FIELD];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function recordTransitStages(context: ReturnType<typeof currentInvocation>, waitMs: number, pickupMs: number | null, hostEvalMs: number | null): void {
+  if (pickupMs !== null) addStage("pickup", pickupMs, context);
+  if (hostEvalMs === null) return;
+  addStage("host_eval", hostEvalMs, context);
+  addStage("bridge_transit", Math.max(0, waitMs - hostEvalMs), context);
 }
 
 function cancelQueuedBehindLivePanel(
