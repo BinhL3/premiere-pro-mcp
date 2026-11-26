@@ -2512,6 +2512,19 @@ function __clipKeyframeBase(clip) {
   return { ok: true, inTicks: inTicks, durationSeconds: durationSeconds };
 }
 
+// Decimal digits of a non-negative tick count. ExtendScript prints numbers of
+// 1e15 or more (about 65 minutes of ticks) in exponent form, which never equals
+// Premiere's decimal Time.ticks, so print in 8-digit groups below that limit.
+function __tickDigits(ticks) {
+  var n = Math.round(Number(ticks));
+  if (!isFinite(n) || n < 0) return null;
+  if (n < 100000000) return String(n);
+  var high = Math.floor(n / 100000000);
+  var low = String(n - high * 100000000);
+  while (low.length < 8) low = "0" + low;
+  return __tickDigits(high) + low;
+}
+
 // Marker setters accept seconds on some hosts; Time getters may be detached.
 function __markerStoredTicks(marker, field) {
   try {
@@ -2521,9 +2534,8 @@ function __markerStoredTicks(marker, field) {
   } catch (readMarkerTimeError) { return null; }
 }
 function __setMarkerTick(marker, field, ticks) {
-  var numeric = Number(ticks);
-  if (!isFinite(numeric) || numeric < 0) return false;
-  var wanted = Math.round(numeric).toFixed(0);
+  var wanted = __tickDigits(ticks);
+  if (wanted === null) return false;
   if (__markerStoredTicks(marker, field) === wanted) return true;
   try { marker[field].ticks = wanted; } catch (markerTickWriteError) {}
   if (__markerStoredTicks(marker, field) === wanted) return true;
@@ -2827,7 +2839,7 @@ function __qeUndoSteps(direction, count, acknowledgeMarkers, target) {
   };
   var start = readIndex();
   if (start === null) return { ok: false, status: "unavailable", error: "This Premiere host does not expose qe.project.undoStackIndex(), so " + direction + " cannot be checked. No " + direction + " was attempted.", done: 0 };
-  if (hasTarget && target >= start) return { ok: false, status: "rejected", error: "undo_to_stack_index " + target + " is not below Premiere's undo-stack position " + start + ". No undo was attempted.", done: 0, startIndex: start, index: start };
+  if (hasTarget && target >= start) return { ok: false, status: "rejected", notAttempted: true, error: "undo_to_stack_index " + target + " is not below Premiere's undo-stack position " + start + ". No undo was attempted.", done: 0, startIndex: start, index: start };
   var markerBarrier = __markerUndoBarrier(direction, hasTarget ? start - target : count, start, acknowledgeMarkers === true);
   if (!markerBarrier.ok) return { ok: false, status: "marker_boundary", error: markerBarrier.error, done: 0, startIndex: start, index: start };
   var step = direction === "undo" ? -1 : 1;
@@ -2899,6 +2911,12 @@ function __undoStepsResult(outcome, doneKey) {
     summary.stackVerified = false;
     summary.warning = outcome.error + (/Do not retry/.test(outcome.error) ? "" : " " + outcome.done + " step(s) were " + (doneKey === "redone" ? "redone" : "undone") + ". Do not retry the whole count; inspect the project first.");
     return __result(summary);
+  }
+  // Refused before any step, or the first step left the stack where it was:
+  // nothing changed, so this must not leave a recovery lock.
+  if (!outcome.ok && outcome.done === 0 && (outcome.notAttempted || outcome.status === "did_not_move" || outcome.status === "marker_boundary" || outcome.status === "unavailable")) {
+    summary.mutationOutcome = "not_applied";
+    summary.timelineChanged = false;
   }
   if (!outcome.ok) return __jsonStringify({ success: false, error: outcome.error, data: summary });
   summary.stackVerified = true;
@@ -3090,7 +3108,8 @@ function __transitionSnapshot(track) {
   }
   return result;
 }
-function __transitionEditGuard(seq, scopes) {
+function __transitionEditGuard(seq, scopes, reportError) {
+  var fail = reportError || __error;
   var affected = [], seen = {};
   try {
     for (var si = 0; si < scopes.length; si++) {
@@ -3104,9 +3123,9 @@ function __transitionEditGuard(seq, scopes) {
       }
     }
   } catch (transitionReadError) {
-    return __error("Transition safety could not be inspected; no edit was attempted. Inspect the track in Premiere before retrying. " + String(transitionReadError), { mutationOutcome: "not_applied", timelineChanged: false, mutationAttempted: false, transitionsAffected: null });
+    return fail("Transition safety could not be inspected; no edit was attempted. Inspect the track in Premiere before retrying. " + String(transitionReadError), { mutationOutcome: "not_applied", timelineChanged: false, mutationAttempted: false, transitionsAffected: null });
   }
-  if (affected.length) return __error("The edit could strand an attached transition. Use remove_transition for the listed indices, or edit the transition in Premiere, then inspect and retry; nothing changed.", { mutationOutcome: "not_applied", timelineChanged: false, mutationAttempted: false, transitionsAffected: affected });
+  if (affected.length) return fail("The edit could strand an attached transition. Use remove_transition for the listed indices, or edit the transition in Premiere, then inspect and retry; nothing changed.", { mutationOutcome: "not_applied", timelineChanged: false, mutationAttempted: false, transitionsAffected: affected });
   return null;
 }
 

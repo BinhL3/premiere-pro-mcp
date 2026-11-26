@@ -15,6 +15,7 @@ vi.mock("../../src/bridge/file-bridge.js", () => ({
 import { sendCommand } from "../../src/bridge/file-bridge.js";
 import { getProjectTools } from "../../src/tools/project.js";
 import { getTrackTargetingTools } from "../../src/tools/track-targeting.js";
+import { mutationReceipt } from "../../src/workflows/mutation-receipt.js";
 
 const mockedSendCommand = vi.mocked(sendCommand);
 const bridgeOptions: BridgeOptions = { tempDir: "/tmp/qe-undo", timeoutMs: 5000 };
@@ -114,13 +115,27 @@ describe("undo, redo and multiple_undo step QE's undo stack and check its positi
     expect(mockedSendCommand).toHaveBeenCalledTimes(3);
   });
 
-  it("reports nothing to redo when the stack is already at the top", async () => {
+  it("reports nothing to redo when the stack is already at the top, as not_applied", async () => {
     undoHost(5, 5);
-    await expect(targeting.redo.handler({ expected_undo_stack_index: 5 })).resolves.toMatchObject({
+    const result = await targeting.redo.handler({ expected_undo_stack_index: 5 }) as { success: boolean; data?: Record<string, unknown> };
+    expect(result).toMatchObject({
       success: false,
       error: expect.stringContaining("Nothing to redo"),
-      data: { stackStatus: "did_not_move", redone: 0 },
+      data: { stackStatus: "did_not_move", redone: 0, mutationOutcome: "not_applied", timelineChanged: false },
     });
+    expect(mutationReceipt(false, result.data, { dispatched: true }, "redo").outcome).toBe("not_applied");
+  });
+
+  it("an undo past Premiere's history limit reports the partial undo, then nothing to undo without a lock (live: 80 requested, 32 kept)", async () => {
+    // Premiere keeps 32 History states by default: the stack stops moving at 1314.
+    const stack = undoHost(1346, 1346, { undo: () => { if (stack.index > 1314) stack.index -= 1; return true; } });
+    const partial = await targeting.multiple_undo.handler({ count: 80, batch_size: 32, expected_undo_stack_index: 1346 }) as { success: boolean; data: Record<string, unknown> };
+    expect(partial).toMatchObject({ success: true, data: { undone: 32, undoStackIndexBefore: 1346, undoStackIndexAfter: 1314, outcome: "committed_unverified", warning: expect.stringMatching(/Only 32 of 80 undo steps/) } });
+    expect(partial.data.mutationOutcome).toBeUndefined();
+    expect(partial.data.timelineChanged).toBeUndefined();
+    const empty = await targeting.multiple_undo.handler({ count: 48, batch_size: 32, expected_undo_stack_index: 1314 }) as { success: boolean; data?: Record<string, unknown> };
+    expect(empty).toMatchObject({ success: false, error: expect.stringContaining("Nothing to undo"), data: { undone: 0, mutationOutcome: "not_applied", timelineChanged: false } });
+    expect(mutationReceipt(false, empty.data, { dispatched: true }, "multiple_undo").outcome).toBe("not_applied");
   });
 
   it("does not undo at all on a host without undoStackIndex", async () => {

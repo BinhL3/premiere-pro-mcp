@@ -238,7 +238,7 @@ export function getStockTitleTools(bridgeOptions: BridgeOptions, catalog: () => 
 
     add_title: {
       description:
-        "Add an on-screen title from plain text using a stock Essential Graphics template that ships with Premiere (default: Basic Title). Pass text for one line, or lines to fill the template's text fields in order (for example a lower third's name and role). Premiere-built templates (kind 'premiere') get the text baked into a verified copy before import, because Premiere exposes no writable text for them (textVerification 'template_verified'; confirm the render with export_frame). The baked copy path is returned as templateFile and saved under the application support premiere-pro-mcp/titles folder (macOS: ~/Library/Application Support/premiere-pro-mcp/titles). The cache keeps the newest 50 baked copies by modification time; export or copy templates elsewhere if a project needs older copies retained. After Effects-built templates (kind 'after_effects') are imported and their text fields written by position and read back from Premiere (textVerification 'verified', 'mismatch', 'missing_property', or 'committed_unverified'). The graphic is trimmed to duration_seconds and its length read back. Optional styling: font_family (PostScript name) and font_size write every text run of each AE text control when the template allows font editing (Premiere 26 fontEditValue/fontSizeEditValue runs, or legacy fontName/fontSize keys); fill_color requires one exposed Fill Color control; position moves the whole graphic through intrinsic normalized Motion Position. Each requested field has styleChecks readback. Premiere-authored font/fill styling and align are refused before import: no reliable writable/readable CEP 26.5.2 contract is established. Tracking is unsupported. Font readback confirms the stored name, not installation or rendered glyphs. Use list_stock_titles to see templates, their kind, and how many lines each takes.",
+        "Add an on-screen title from plain text using a stock Essential Graphics template that ships with Premiere (default: Basic Title). Pass text for one line, or lines to fill the template's text fields in order (for example a lower third's name and role). Premiere-built templates (kind 'premiere') get the text baked into a verified copy before import, because Premiere exposes no writable text for them (textVerification 'template_verified'; confirm the render with export_frame). The baked copy path is returned as templateFile and saved under the application support premiere-pro-mcp/titles folder (macOS: ~/Library/Application Support/premiere-pro-mcp/titles). The cache keeps the newest 50 baked copies by modification time; export or copy templates elsewhere if a project needs older copies retained. After Effects-built templates (kind 'after_effects') are imported and their text fields written by position and read back from Premiere (textVerification 'verified', 'mismatch', 'missing_property', or 'committed_unverified'). The graphic is trimmed to duration_seconds and its length read back. Optional styling: font_family (PostScript name) and font_size write every text run of each AE text control when the template allows font editing (Premiere 26 fontEditValue/fontSizeEditValue runs, or legacy fontName/fontSize keys); fill_color requires one exposed Fill Color control; position moves the whole graphic through intrinsic normalized Motion Position. Each requested field has styleChecks readback. Premiere-authored font/fill styling and align are refused before import: no reliable writable/readable CEP 26.5.2 contract is established. Tracking is unsupported. Font readback confirms the stored name, not installation or rendered glyphs. Use list_stock_titles to see templates, their kind, and how many lines each takes. Fields past the lines given keep the template's default text; they are listed in untouchedFields with a warning.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -452,6 +452,13 @@ export function getStockTitleTools(bridgeOptions: BridgeOptions, catalog: () => 
         let outcome = textVerification;
         if (textOk) outcome = durationStatus === "verified" ? textVerification : "committed_unverified";
         const styleChecks = compareTitleStyle(args, lines.length, titleStyleReadback);
+        // Fields past the given lines keep the template's placeholder, which then renders.
+        const untouchedFields = template.textFields.slice(lines.length)
+          .filter((field) => field.defaultText.trim() !== "")
+          .map((field) => ({ index: field.index, label: field.label, defaultText: field.defaultText }));
+        if (untouchedFields.length) {
+          warnings.push(`${untouchedFields.length} text field(s) of ${template.name} still show the template's default text (${untouchedFields.map((field) => `"${field.defaultText}"`).join(", ")}); pass a line for every field, using "" to blank one.`);
+        }
         if (styleChecks.some(check => check.status !== "verified")) {
           outcome = "committed_unverified";
           warnings.push("One or more requested style fields were unavailable or did not read back; inspect styleChecks. The title may already exist.");
@@ -470,6 +477,7 @@ export function getStockTitleTools(bridgeOptions: BridgeOptions, catalog: () => 
                 }
               : {}),
             ...(textChecks ? { textChecks } : {}),
+            ...(untouchedFields.length ? { untouchedFields } : {}),
             ...(warnings.length ? { warnings } : {}),
           },
         };

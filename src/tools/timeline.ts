@@ -443,7 +443,7 @@ export function getTimelineTools(
     },
 
     move_clip: {
-      description: "Refuses attached transitions or unreadable transition collections before structural edits; inspect transitionsAffected and use remove_transition first. EXPERIMENTAL (undocumented QE DOM for track changes): Move a clip to a new position on the timeline; optional track moves use Premiere's QE API and may not work on every version.",
+      description: "Refuses attached transitions or unreadable transition collections before structural edits; inspect transitionsAffected and use remove_transition first. Move a clip to a new position on the timeline. Its linked partners on other tracks (synced audio or video) move with it by the same whole-frame displacement, so a sub-frame audio offset is kept; each partner is checked before any write (locked track, occupied destination, transitions) and its range and source in/out are read back. Pass include_linked:false to move only this clip. EXPERIMENTAL (undocumented QE DOM for track changes): optional track moves use Premiere's QE API, need include_linked:false for a linked clip, and may not work on every version.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -459,10 +459,14 @@ export function getTimelineTools(
             type: "number",
             description: "Optional new track index to move the clip to",
           },
+          include_linked: {
+            type: "boolean",
+            description: "Move linked partners on other tracks by the same displacement (default true). False moves only this clip, leaving its partners where they are.",
+          },
         },
         required: ["node_id", "new_start_seconds"],
       },
-      handler: async (args: { node_id: string; new_start_seconds: number; new_track_index?: number }) => {
+      handler: async (args: { node_id: string; new_start_seconds: number; new_track_index?: number; include_linked?: boolean }) => {
         if (!Number.isFinite(args.new_start_seconds) || args.new_start_seconds < 0) {
           return { success: false, error: "new_start_seconds must be finite and non-negative timeline seconds." };
         }
@@ -476,11 +480,16 @@ export function getTimelineTools(
 
           var clip = result.clip;
           var clipName = clip.name;
+          var partners = ${args.include_linked === false ? "[]" : "__linkedPartnerClips(result)"};
+          ${args.new_track_index !== undefined ? `if (partners.length) return __refuse("This clip is linked to " + partners.length + " clip(s) on other tracks, and move_clip cannot change a linked group's track. Pass include_linked:false to move only this clip, or move the group in Premiere. Nothing was changed.");` : ""}
 
           // Snap both visible edges to the active sequence frame grid.
           var seq = app.project.activeSequence;
           var frameTicks = seq && seq.timebase ? parseFloat(seq.timebase) : NaN;
           if (!isFinite(frameTicks) || frameTicks <= 0) return __refuse("The active sequence frame grid could not be read; no move was attempted.");
+          // A linked audio clip can start between frames. The group then moves
+          // by whole frames, keeping that offset, so its own grid is not checked.
+          var gridChecked = !partners.length || result.trackType === "video";
 
           // Capture the visible span and source range as tick strings before any
           // write. Premiere can mutate the same Time instance on write, so never
@@ -492,19 +501,51 @@ export function getTimelineTools(
           var originalOutPointTicks = String(clip.outPoint.ticks);
           var spanTicks = parseFloat(originalEndTicks) - parseFloat(originalStartTicks);
           if (!(spanTicks > 0)) return __refuse("Clip has an empty or inverted timeline range; move was not attempted.");
-          if (Math.abs(parseFloat(originalStartTicks) / frameTicks - Math.round(parseFloat(originalStartTicks) / frameTicks)) > 0.001 ||
+          if (gridChecked && (Math.abs(parseFloat(originalStartTicks) / frameTicks - Math.round(parseFloat(originalStartTicks) / frameTicks)) > 0.001 ||
               Math.abs(parseFloat(originalEndTicks) / frameTicks - Math.round(parseFloat(originalEndTicks) / frameTicks)) > 0.001 ||
-              Math.abs(spanTicks / frameTicks - Math.round(spanTicks / frameTicks)) > 0.001) {
+              Math.abs(spanTicks / frameTicks - Math.round(spanTicks / frameTicks)) > 0.001)) {
             return __refuse("The clip's existing start, end or duration is off the active sequence frame grid. Repair it in Premiere before moving; no change was attempted.");
           }
 
           var requestedStartTicks = __secondsToTicks(${args.new_start_seconds});
-          var newStartTicks = __snapSequenceTicks(seq, requestedStartTicks);
+          var newStartTicks = partners.length
+            ? parseFloat(originalStartTicks) + __snapSequenceTicks(seq, requestedStartTicks - parseFloat(originalStartTicks))
+            : __snapSequenceTicks(seq, requestedStartTicks);
           var newEndTicks = newStartTicks + spanTicks;
-          var transitionFailure = __transitionEditGuard(seq, [
+          var moveDelta = newStartTicks - parseFloat(originalStartTicks);
+          var guardScopes = [
             { type: result.trackType, index: result.trackIndex, start: Number(clip.start.ticks), end: Number(clip.end.ticks) },
             { type: result.trackType, index: ${args.new_track_index ?? "result.trackIndex"}, start: newStartTicks, end: newEndTicks }
-          ]);
+          ];
+
+          // Every linked partner is checked before anything is written, so a
+          // partner that cannot follow refuses the move instead of desyncing it.
+          var groupIds = {};
+          groupIds[String(clip.nodeId)] = true;
+          for (var gp = 0; gp < partners.length; gp++) groupIds[String(partners[gp].clip.nodeId)] = true;
+          var partnerMoves = [];
+          for (var pm = 0; pm < partners.length; pm++) {
+            var partner = partners[pm];
+            var pTrack = (partner.trackType === "video" ? seq.videoTracks : seq.audioTracks)[partner.trackIndex];
+            var pStart = parseFloat(partner.clip.start.ticks), pEnd = parseFloat(partner.clip.end.ticks);
+            var pLabel = (partner.trackType === "video" ? "V" : "A") + (partner.trackIndex + 1);
+            if (!(pEnd > pStart) || !isFinite(pStart)) return __refuse("Linked clip on " + pLabel + " has an unreadable timeline range; nothing was changed.");
+            if (pStart + moveDelta < 0) return __refuse("Moving the linked clip on " + pLabel + " would put it before the sequence start; nothing was changed.");
+            if (__isTrackLocked(pTrack)) return __refuse("Linked clip track " + pLabel + " is locked; unlock it or pass include_linked:false. Nothing was changed.");
+            for (var oc = 0; oc < pTrack.clips.numItems; oc++) {
+              var other = pTrack.clips[oc];
+              if (groupIds[String(other.nodeId)]) continue;
+              if (parseFloat(other.start.ticks) < pEnd + moveDelta && parseFloat(other.end.ticks) > pStart + moveDelta) {
+                return __refuse("Another clip occupies the linked clip's destination on " + pLabel + " (" + __ticksToSeconds(other.start.ticks) + "-" + __ticksToSeconds(other.end.ticks) + "s); nothing was changed.");
+              }
+            }
+            guardScopes.push({ type: partner.trackType, index: partner.trackIndex, start: pStart, end: pEnd });
+            guardScopes.push({ type: partner.trackType, index: partner.trackIndex, start: pStart + moveDelta, end: pEnd + moveDelta });
+            partnerMoves.push({ nodeId: String(partner.clip.nodeId), label: pLabel, trackType: partner.trackType, trackIndex: partner.trackIndex,
+              start: String(partner.clip.start.ticks), end: String(partner.clip.end.ticks), destStart: pStart + moveDelta, destEnd: pEnd + moveDelta,
+              inPoint: String(partner.clip.inPoint.ticks), outPoint: String(partner.clip.outPoint.ticks) });
+          }
+          var transitionFailure = __transitionEditGuard(seq, guardScopes);
           if (transitionFailure) return transitionFailure;
 
           ${args.new_track_index !== undefined ? `
@@ -590,10 +631,10 @@ export function getTimelineTools(
           var moveDrift = [];
           var actualStartTicks = parseFloat(after.clip.start.ticks);
           var actualEndTicks = parseFloat(after.clip.end.ticks);
-          if (Math.abs(actualStartTicks - newStartTicks) > frameTicks / 1000 || Math.abs(actualStartTicks / frameTicks - Math.round(actualStartTicks / frameTicks)) > 0.001) {
+          if (Math.abs(actualStartTicks - newStartTicks) > frameTicks / 1000 || (gridChecked && Math.abs(actualStartTicks / frameTicks - Math.round(actualStartTicks / frameTicks)) > 0.001)) {
             moveDrift.push("requested start ${args.new_start_seconds}s, read back " + actualStart + "s");
           }
-          if (Math.abs(actualEndTicks / frameTicks - Math.round(actualEndTicks / frameTicks)) > 0.001) moveDrift.push("the clip end read back off the active sequence frame grid");
+          if (gridChecked && Math.abs(actualEndTicks / frameTicks - Math.round(actualEndTicks / frameTicks)) > 0.001) moveDrift.push("the clip end read back off the active sequence frame grid");
           if (Math.abs((actualEndTicks - actualStartTicks) - spanTicks) > frameTicks / 1000) {
             moveDrift.push("visible duration changed from " + __ticksToSeconds(spanTicks) + "s to " + (actualEnd - actualStart) + "s");
           }
@@ -623,10 +664,41 @@ export function getTimelineTools(
           }
           ` : ""}
 
+          // Premiere may already have moved a partner with the target; one still at
+          // its original range is written, anything else stops for inspection.
+          var linkedMoved = [];
+          for (var lw = 0; lw < partnerMoves.length; lw++) {
+            var move = partnerMoves[lw];
+            var partnerFailure = null;
+            try {
+              var livePartner = __findClip(move.nodeId);
+              if (!livePartner) partnerFailure = "it could not be found after the target moved";
+              else {
+                var atDest = Math.abs(parseFloat(livePartner.clip.start.ticks) - move.destStart) <= frameTicks / 1000 && Math.abs(parseFloat(livePartner.clip.end.ticks) - move.destEnd) <= frameTicks / 1000;
+                var atOrigin = String(livePartner.clip.start.ticks) === move.start && String(livePartner.clip.end.ticks) === move.end;
+                if (!atDest && !atOrigin) partnerFailure = "Premiere moved it to " + __ticksToSeconds(livePartner.clip.start.ticks) + "s on its own";
+                else if (!atDest) __writeClipSpan(livePartner.clip, move.destStart, move.destEnd);
+                var partnerAfter = __findClip(move.nodeId);
+                if (!partnerFailure && (!partnerAfter ||
+                    Math.abs(parseFloat(partnerAfter.clip.start.ticks) - move.destStart) > frameTicks / 1000 ||
+                    Math.abs(parseFloat(partnerAfter.clip.end.ticks) - move.destEnd) > frameTicks / 1000 ||
+                    String(partnerAfter.clip.inPoint.ticks) !== move.inPoint || String(partnerAfter.clip.outPoint.ticks) !== move.outPoint)) {
+                  partnerFailure = "its range or source in/out did not read back as requested";
+                }
+              }
+            } catch (partnerErr) { partnerFailure = "Premiere rejected the write (" + partnerErr.toString() + ")"; }
+            if (partnerFailure) {
+              return __error("The clip moved, but its linked clip on " + move.label + " did not follow: " + partnerFailure + ". Picture and sound may be out of sync; inspect the group or use Undo.",
+                { timelineChanged: true, outcome: "committed_unverified", verified: false, linkedPartnersMoved: linkedMoved, failedPartnerId: move.nodeId });
+            }
+            linkedMoved.push({ nodeId: move.nodeId, track: move.label, trackType: move.trackType, trackIndex: move.trackIndex, newStart: __ticksToSeconds(move.destStart), newEnd: __ticksToSeconds(move.destEnd) });
+          }
+
           var movePayload = {
             transitionsAffected: [],
             moved: true,
             verified: true,
+            linkedPartnersMoved: linkedMoved,
             clipName: clipName,
             newStart: actualStart,
             newEnd: actualEnd,

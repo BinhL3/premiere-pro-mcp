@@ -264,6 +264,15 @@ describe("add_title", () => {
     expect(state.clip!.props.map((p) => JSON.parse(String(p.value)).textEditValue)).toEqual(["Director", "Ada Lovelace"]);
     expect(state.imported?.[1]).toBe(String(2 * TICKS));
     expect(result.data.duration.actualSeconds).toBe(3);
+    expect(result.data.untouchedFields).toBeUndefined();
+  });
+
+  it("flags template fields left at their placeholder text", async () => {
+    hostWith({ textDefaults: ["Second Line is Smaller", "Your Name Here"] });
+    const result = await tools.add_title.handler({ lines: ["Director"], template: "basic lower third" }) as TitleResult;
+    expect(result.data.outcome).toBe("verified");
+    expect(result.data.untouchedFields).toEqual([{ index: 1, label: "TextLayer", defaultText: "Your Name Here" }]);
+    expect(result.data.warnings).toEqual([expect.stringContaining('"Your Name Here"')]);
   });
 
   it("reports the frame-snapped start Premiere stored alongside the requested start", async () => {
