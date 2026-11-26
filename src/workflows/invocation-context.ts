@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { performance } from "node:perf_hooks";
 
-export type OperationStage = "queue_wait" | "host_wait" | "dispatch" | "readback" | "analysis" | "artifact_validation";
+export type OperationStage = "queue_wait" | "lease_acquire" | "host_wait" | "dispatch" | "pickup" | "host_eval" | "bridge_transit" | "reply_notice" | "readback" | "analysis" | "artifact_validation";
 export interface InvocationContext {
   signal?: AbortSignal;
   progressToken?: string | number;
@@ -73,6 +73,10 @@ export function startStage(stage: OperationStage, context = currentInvocation())
     if (!recorded && context) context.stages[stage] = (context.stages[stage] ?? 0) + performance.now() - started;
     recorded = true;
   };
+}
+/** Add an externally measured duration (for example the host's own clock). */
+export function addStage(stage: OperationStage, ms: number, context = currentInvocation()): void {
+  if (context && Number.isFinite(ms) && ms >= 0) context.stages[stage] = (context.stages[stage] ?? 0) + ms;
 }
 export function measureStageSync<T>(stage: OperationStage, work: () => T, context = currentInvocation()): T {
   const finish = startStage(stage, context);

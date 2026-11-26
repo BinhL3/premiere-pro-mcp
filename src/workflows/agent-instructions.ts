@@ -38,6 +38,8 @@ export function buildPremiereInstructions(registeredTools: ReadonlySet<string>):
     "Retrieve native transcript evidence when this UXP backend is connected. Preserve source timing and speaker evidence; do not infer speech from filenames.");
   route(["plan_filler_word_removal"],
     "Hesitation-sound removal needs a transcript that preserves disfluencies, such as Premiere transcription or verbatim ASR; Whisper's default output omits 'um' and 'uh'. Check transcript provenance before treating an empty match as evidence that no hesitation sounds occurred.");
+  route(["apply_batch"],
+    "For two or more timeline edits (placing clips, trims, moves, ripple deletes, splits, clip or track volume, video or audio transitions, clip properties, markers, effects and effect properties), send them as one apply_batch instead of a loop of single calls or execute_extendscript: one Premiere round trip, pre-flighted so a bad batch changes nothing. A partial result lists exactly which operations were applied and sets the recovery lock; it is not one undo step.");
   route(["set_clip_duration"],
     "Set a placed clip's timeline length or extend a still image by moving only its end; it refuses overlaps with the next clip and restores the original end if Premiere clamps. Clip speed has no documented scripting setter, so speed_change and set_clip_speed_qe always fail before mutation; use set_clip_duration for timing, or the Speed/Duration UI to retime.");
   route(["freeze_frame", "create_source_freeze_frame"],

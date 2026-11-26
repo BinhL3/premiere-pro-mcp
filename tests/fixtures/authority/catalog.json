@@ -4509,6 +4509,13 @@
     ]
   },
   {
+    "tool": "apply_batch",
+    "args": {},
+    "required": [
+      "edit"
+    ]
+  },
+  {
     "tool": "set_audio_track_effect_bypass",
     "args": {},
     "required": [

@@ -1,7 +1,7 @@
 import { expectedProjectPath, expectedHostTarget } from "./project-guard.js";
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { assertInvocationNotCancelled, currentInvocation, markHostDispatch, measureStage, measureStageSync, type InvocationContext } from "../workflows/invocation-context.js";
-import { getTempDir, withBridgeWorkflow, type BridgeOptions } from "./file-bridge.js";
+import { bridgeCaptureActive, getTempDir, withBridgeWorkflow, type BridgeOptions } from "./file-bridge.js";
 import { inspectHostRecovery, markHostRecovery } from "./host-lease.js";
 import { EventEmitter } from "node:events";
 import { createServer, request as httpRequest, type Server } from "node:http";
@@ -344,6 +344,7 @@ export class UxpWebSocketBridge extends EventEmitter {
     args: Record<string, unknown> = {},
     requestOptions: UxpRequestOptions = {},
   ): Promise<unknown> {
+    if (bridgeCaptureActive()) throw new UxpBridgeError("BATCH_UNSUPPORTED", "apply_batch cannot include UXP operations; nothing was sent");
     if (!this.getState().connected) await this.claim();
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.hello) throw new UxpBridgeError("UXP_NOT_CONNECTED", "Premiere UXP bridge is not connected");
     return withBridgeWorkflow(this.hostBridgeOptions, () => measureStage("host_wait", () => this.requestOwned(command, args, requestOptions)));

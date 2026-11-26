@@ -68,3 +68,38 @@ describe("CEP headless command routing", () => {
     expect(stopped.writes.some((file) => file.includes("headless-engine"))).toBe(false);
   });
 });
+
+describe("CEP command watcher", () => {
+  const watcher = between("var commandWatcher = null;", "function stopBridge(");
+  function panel(watch: (dir: string, options: unknown, listener: (event: string, name: string | null) => void) => unknown) {
+    const processed: number[] = [];
+    const state: Record<string, unknown> = { tempDir: "/tmp/cep-watch", bridgeRunning: true, processCommands: () => processed.push(1), fs: { watch } };
+    runInNewContext(watcher, state);
+    return { run: (code: string) => runInNewContext(code, state), processed };
+  }
+
+  it("processes commands as soon as a cmd_*.jsx file appears, ignoring other files", () => {
+    let listener: ((event: string, name: string | null) => void) | undefined;
+    let closed = 0;
+    const handle = { on() {}, close: () => { closed++; } };
+    const p = panel((_dir, _options, callback) => { listener = callback; return handle; });
+    p.run("startCommandWatcher()");
+    listener!("rename", "cmd_x.jsx.staged");
+    listener!("rename", "res_x.json");
+    expect(p.processed).toHaveLength(0);
+    listener!("rename", "cmd_x.jsx");
+    listener!("rename", null);
+    expect(p.processed).toHaveLength(2);
+    p.run("bridgeRunning = false");
+    listener!("rename", "cmd_y.jsx");
+    expect(p.processed).toHaveLength(2);
+    p.run("stopCommandWatcher()");
+    expect(closed).toBe(1);
+  });
+
+  it("falls back to polling when the directory cannot be watched", () => {
+    const p = panel(() => { throw new Error("ENOSYS"); });
+    expect(() => p.run("startCommandWatcher()")).not.toThrow();
+    expect(p.run("commandWatcher")).toBeNull();
+  });
+});

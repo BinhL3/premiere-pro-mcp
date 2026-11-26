@@ -5,10 +5,12 @@ import { sendCommand, type BridgeOptions } from "../bridge/file-bridge.js";
 // hetpatel-11/Adobe_Premiere_Pro_MCP (MIT). This uses the same frame-grid,
 // exact-target and readback safeguards as this project's video transitions.
 // A QE write is experimental and cannot prove how the crossfade sounds.
-const AUDIO_TRANSITION_HELPERS = [
+export const AUDIO_TRANSITION_HELPERS = [
   "function __audioTransitionResolve(name) {",
   "  var resolved = null;",
   "  try { if (qe.project.getAudioTransitionByName) resolved = qe.project.getAudioTransitionByName(name); } catch (byNameError) {}",
+  // Premiere 27 returns an unnamed object for any unknown name.
+  "  if (resolved && String(resolved.name || '') === '') resolved = null;",
   "  if (!resolved) {",
   "    try {",
   "      var catalog = __qeCatalogFrom(qe.project.getAudioTransitionList());",
@@ -87,8 +89,9 @@ function audioTransitionScript(
     "var qeSeq = qe.project.getActiveSequence();",
     "if (!seq || !qeSeq) return __refuse('No active sequence; no audio transition was attempted.');",
     ...target,
-    "var track = seq.audioTracks[trackIndex];",
-    "var qeTrack = qeSeq.getAudioTrackAt(trackIndex);",
+    "var track = trackIndex < seq.audioTracks.numTracks ? seq.audioTracks[trackIndex] : null;",
+    "var qeTrack = null;",
+    "if (track) { try { qeTrack = qeSeq.getAudioTrackAt(trackIndex); } catch (qeTrackError) {} }",
     "if (!track || !qeTrack) return __refuse('Audio track not found; nothing was changed.');",
     "var frameTicks = Number(seq.timebase);",
     "if (!isFinite(frameTicks) || frameTicks <= 0 || frameTicks > TICKS_PER_SECOND) return __refuse('Invalid sequence frame grid; nothing was changed.');",
