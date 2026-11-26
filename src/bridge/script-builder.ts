@@ -2827,7 +2827,7 @@ function __qeUndoSteps(direction, count, acknowledgeMarkers, target) {
   };
   var start = readIndex();
   if (start === null) return { ok: false, status: "unavailable", error: "This Premiere host does not expose qe.project.undoStackIndex(), so " + direction + " cannot be checked. No " + direction + " was attempted.", done: 0 };
-  if (hasTarget && target >= start) return { ok: false, status: "rejected", error: "undo_to_stack_index " + target + " is not below Premiere's undo-stack position " + start + ". No undo was attempted.", done: 0, startIndex: start, index: start };
+  if (hasTarget && target >= start) return { ok: false, status: "rejected", notAttempted: true, error: "undo_to_stack_index " + target + " is not below Premiere's undo-stack position " + start + ". No undo was attempted.", done: 0, startIndex: start, index: start };
   var markerBarrier = __markerUndoBarrier(direction, hasTarget ? start - target : count, start, acknowledgeMarkers === true);
   if (!markerBarrier.ok) return { ok: false, status: "marker_boundary", error: markerBarrier.error, done: 0, startIndex: start, index: start };
   var step = direction === "undo" ? -1 : 1;
@@ -2899,6 +2899,12 @@ function __undoStepsResult(outcome, doneKey) {
     summary.stackVerified = false;
     summary.warning = outcome.error + (/Do not retry/.test(outcome.error) ? "" : " " + outcome.done + " step(s) were " + (doneKey === "redone" ? "redone" : "undone") + ". Do not retry the whole count; inspect the project first.");
     return __result(summary);
+  }
+  // Refused before any step, or the first step left the stack where it was:
+  // nothing changed, so this must not leave a recovery lock.
+  if (!outcome.ok && outcome.done === 0 && (outcome.notAttempted || outcome.status === "did_not_move" || outcome.status === "marker_boundary" || outcome.status === "unavailable")) {
+    summary.mutationOutcome = "not_applied";
+    summary.timelineChanged = false;
   }
   if (!outcome.ok) return __jsonStringify({ success: false, error: outcome.error, data: summary });
   summary.stackVerified = true;

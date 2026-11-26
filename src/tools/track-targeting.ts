@@ -2056,11 +2056,16 @@ export function getTrackTargetingTools(bridgeOptions: BridgeOptions) {
           undone += data?.undone ?? 0;
           if (!result.success || data?.stackVerified !== true) {
             if (undone === 0) return result;
+            // An earlier batch undid steps, so this batch's own "nothing changed" does not describe the call.
+            const { mutationOutcome: _batchOutcome, timelineChanged: _batchChanged, ...batchData } = data ?? {};
+            const stoppedEarly = result.success === false && data?.stackStatus === "did_not_move" && data?.undone === 0;
             return {
               success: true,
               data: {
-                ...(data ?? {}), undone, undoStackIndexBefore: firstIndex, outcome: "committed_unverified", stackVerified: false,
-                warning: `${result.error ?? (data?.warning as string | undefined) ?? "Undo stopped"} ${undone} step(s) were undone. Do not retry the whole count; inspect the project first.`,
+                ...batchData, undone, undoStackIndexBefore: firstIndex, outcome: "committed_unverified", stackVerified: false,
+                warning: stoppedEarly
+                  ? `Only ${undone} of ${count} undo steps were available; Premiere's undo stack stopped moving (its History panel keeps a limited number of states). Do not retry the whole count; inspect the project first.`
+                  : `${result.error ?? (data?.warning as string | undefined) ?? "Undo stopped"} ${undone} step(s) were undone. Do not retry the whole count; inspect the project first.`,
               },
             };
           }
