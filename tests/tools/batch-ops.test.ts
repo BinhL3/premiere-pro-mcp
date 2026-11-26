@@ -66,15 +66,10 @@ describe("apply_batch validation", () => {
     expect(host).not.toHaveBeenCalled();
   });
 
-  it("refuses a batch whose combined script would exceed the bridge size limit", async () => {
-    const operations = Array.from({ length: 100 }, (_, i) => op("add_transition", { transition_name: "Cross Dissolve", track_index: 0, cut_point_seconds: i + 1 }));
-    const { result } = await applyBatch({ operations });
-    if (result.data?.scriptBytes !== undefined) {
-      expect(result).toMatchObject({ success: false, data: { mutationOutcome: "not_applied", dispatched: false } });
-      expect(host).not.toHaveBeenCalled();
-    } else {
-      expect(host).toHaveBeenCalledTimes(1);
-    }
+  it("refuses more than the sanity cap before anything is sent", async () => {
+    const { result } = await applyBatch({ operations: Array.from({ length: 2001 }, (_, i) => gain(i)) });
+    expect(result).toMatchObject({ success: false, error: expect.stringMatching(/1-2000 items \(2001 given\)/), data: { mutationOutcome: "not_applied", dispatched: false } });
+    expect(host).not.toHaveBeenCalled();
   });
 });
 
@@ -131,6 +126,70 @@ describe("apply_batch execution", () => {
     const { result } = await applyBatch({ operations: [gain(0), gain(1)] });
     expect(result).toMatchObject({ success: false, data: { outcome: "not_applied", mutationOutcome: "not_applied", opsApplied: 0 } });
     expect(mutationReceipt(false, result.data, { dispatched: true }, "apply_batch").outcome).toBe("not_applied");
+  });
+});
+
+const opsInScript = (script: string) => (script.match(/__batchOut\.push/g) ?? []).length;
+const okChunk = (count: number, failAt = -1) => ({
+  success: failAt < 0,
+  data: {
+    batch: { failedIndex: failAt, opsRun: failAt < 0 ? count : failAt + 1, undoStart: 0, undoNow: 0, preflightMs: 5, opMs: Array.from({ length: failAt < 0 ? count : failAt + 1 }, () => 1) },
+    ops: Array.from({ length: failAt < 0 ? count : failAt + 1 }, (_, i) => i === failAt ? { success: false, error: "Clip volume write failed", data: { mutationOutcome: "unknown" } } : JSON.parse(ok())),
+  },
+});
+
+describe("apply_batch chunking", () => {
+  it("splits 250 ops into 3 chunks after one whole-batch pre-flight and keeps compact results small", async () => {
+    host.mockImplementation(async (script: string, options: { mutating?: boolean }) => options?.mutating === false ? { success: true, data: { preflight: "passed" } } : okChunk(opsInScript(script)));
+    const operations = Array.from({ length: 250 }, (_, i) => gain(i));
+    const { result } = await applyBatch({ operations });
+    const calls = host.mock.calls as [string, { mutating?: boolean; timeoutMs?: number }][];
+    expect(calls[0][1]).toMatchObject({ mutating: false });
+    expect(calls[0][0]).toContain("__pfFail(249,");
+    const applies = calls.filter(([, options]) => options.mutating === true);
+    expect(applies.map(([script]) => opsInScript(script))).toEqual([84, 84, 82]);
+    expect(applies[1][0]).toContain("__pfFail(84,");
+    for (const [, options] of applies) expect(options.timeoutMs).toBeLessThanOrEqual(30_000 + 100 * 2_000);
+    expect(result).toMatchObject({ success: true, data: { outcome: "verified", opsApplied: 250, chunks: { count: 3, run: 3 }, statusCounts: { verified: 250 }, operations: [] } });
+    expect(result.data.hostTiming.chunks.map((entry: { first: number; last: number }) => [entry.first, entry.last])).toEqual([[0, 83], [84, 167], [168, 249]]);
+    expect(JSON.stringify(result).length).toBeLessThan(1500);
+
+    host.mockClear();
+    const detailed = (await applyBatch({ operations, detail: "full" })).result;
+    expect(detailed.data.operations).toHaveLength(250);
+    expect(detailed.data.operations[249]).toMatchObject({ index: 249, status: "verified", hostMs: 1 });
+  });
+
+  it("refuses the whole batch as not_applied when pre-flight fails an op in a later chunk", async () => {
+    host.mockImplementation(async (script: string, options: { mutating?: boolean }) => {
+      expect(options?.mutating).toBe(false);
+      return JSON.parse(vm.runInContext(script, fakePremiere().context));
+    });
+    const operations = Array.from({ length: 250 }, (_, i) => op("set_clip_volume", { node_id: i === 230 ? "stale" : i % 2 ? "a1" : "a2", volume_db: -3 }));
+    const { result } = await applyBatch({ operations });
+    expect(host).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ success: false, data: { outcome: "not_applied", mutationOutcome: "not_applied", timelineChanged: false, refusedBeforeChange: true, statusCounts: { refused: 1, not_run: 249 } } });
+    expect(result.data.operations).toEqual([{ index: 230, op: "set_clip_volume", status: "refused", error: expect.stringMatching(/Clip not found: stale/) }]);
+    expect(mutationReceipt(false, result.data, { dispatched: true }, "apply_batch").outcome).toBe("not_applied");
+  });
+
+  it("reports a failure inside chunk 2 with global indices, partial and the recovery lock", async () => {
+    let chunk = 0;
+    host.mockImplementation(async (script: string, options: { mutating?: boolean }) => {
+      if (options?.mutating === false) return { success: true, data: { preflight: "passed" } };
+      chunk++;
+      return okChunk(opsInScript(script), chunk === 2 ? 30 : -1);
+    });
+    const { result } = await applyBatch({ operations: Array.from({ length: 250 }, (_, i) => gain(i)) });
+    expect(chunk).toBe(2);
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringMatching(/stopped at operation 114 \(set_clip_volume\) in chunk 2 of 3.*114 earlier operation\(s\) were applied.*135 did not run/),
+      data: { outcome: "partial", mutationOutcome: "unknown", recoveryRequired: true, timelineChanged: true, opsApplied: 114, appliedThrough: 113, failedOperation: 114, failedChunk: 1, chunks: { count: 3, run: 2 }, statusCounts: { verified: 114, failed: 1, not_run: 135 } },
+    });
+    expect(result.data.appliedOperations).toBeUndefined();
+    expect(result.data.operations).toEqual([{ index: 114, op: "set_clip_volume", status: "failed", error: "Clip volume write failed" }]);
+    expect(mutationReceipt(false, result.data, { dispatched: true }, "apply_batch").outcome).toBe("unknown");
   });
 });
 

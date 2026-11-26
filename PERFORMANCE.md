@@ -88,6 +88,27 @@ Not changed, noted for later: each tool result is sent twice, once as `structure
 as pretty-printed JSON text, so compact text would roughly halve MCP payload size. `ripple_delete`
 sends a dry-run and then the real command; the real script repeats every check.
 
+### Automatic chunking (`apply_batch` past 100 ops)
+
+`apply_batch` takes up to 2,000 operations and splits them into back-to-back chunks, one
+ExtendScript evaluation each. The chunk size is bounded by two limits: at most 100 ops, and a
+script under the 500 KB bridge limit (less 32 KB headroom). Each op's generated script is large
+(about 3.7 KB for a clip gain, 6.3 KB for an audio crossfade), so the byte limit usually binds
+first: ~64 crossfades or ~100 gain changes fit one chunk. Chunks are then evened out (250 gains
+become 84/84/82, not 100/100/50). A 100-op chunk of cheap edits runs in a few seconds of host
+time, far inside its bridge timeout (30 s plus a per-op budget), and the server waits 150 ms
+between chunks so Premiere can repaint and take input.
+
+Pre-flight across chunks:
+
+- Before the first write, every op's handler runs in Node (schema, argument checks, authority,
+  the shared pre-write reads), and every op is pre-flighted in Premiere in read-only commands
+  covering the whole batch. Clip-position checks stop after the first structural op of the batch,
+  as in a single chunk. Any failure refuses the whole batch as `not_applied` with no lock.
+- Each chunk pre-flights again, against the live timeline, at the top of its own evaluation, and
+  `trim_clip`/`ripple_delete` in later chunks re-read the timeline just before their chunk. A
+  refusal there comes after earlier chunks wrote, so it is reported as `partial` with the lock.
+
 ### Bigger change, not built: everything over the UXP WebSocket
 
 The UXP bridge (`src/bridge/uxp-websocket-bridge.ts`) is already a persistent, authenticated
